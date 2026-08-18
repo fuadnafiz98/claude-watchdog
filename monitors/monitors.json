@@ -1,7 +1,7 @@
 [
   {
     "name": "watchdog-resume",
-    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.py\" monitor",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/monitor.sh\"",
     "description": "Turns killed by a transient API error"
   }
 ]

@@ -1,7 +1,7 @@
 # claude-watchdog
 
-Resumes a Claude Code turn that the API killed, so an unattended run keeps going
-instead of sitting at
+A watchdog timer for Claude Code. When the API drops a turn, it resumes it, so an
+unattended run keeps going instead of sitting at
 
 ```
 ⏺ API Error: The response stopped arriving. The response above may be incomplete.
@@ -9,27 +9,30 @@ instead of sitting at
 
 until you come back and type `continue`.
 
-One script, one hook, one monitor. **tmux is not required.**
+Nothing to install beyond the plugin. macOS and Linux. The part that stays resident
+costs **~1–2 MB and zero CPU**, and tmux is optional.
 
 ## Install
+
+From inside a Claude Code session:
 
 ```
 /plugin marketplace add fuadnafiz98/claude-watchdog
 /plugin install watchdog@claude-watchdog
 ```
 
-Restart the session (monitors only start at session start), then arm it:
+Restart the session (monitors start at session start), then arm it:
 
 ```
 /watchdog on
 ```
 
 Off by default — auto-continuing is what you want overnight, not while you're watching.
-Check it with `/watchdog`, which prints which delivery channel is actually live.
+Run `/watchdog` to see whether the in-band channel is actually live.
 
 ## Why it isn't just a hook
 
-Claude Code ends a turn with one of two events, and the difference is the entire design:
+Claude Code ends a turn with one of two events, and the difference is the whole design:
 
 | Event | Fires when | Can it block the stop? |
 | --- | --- | --- |
@@ -37,83 +40,95 @@ Claude Code ends a turn with one of two events, and the difference is the entire
 | `StopFailure` | the turn dies on an API error | **no** |
 
 An API error fires **only** `StopFailure`, whose output is discarded. So a hook cannot
-refuse to stop, cannot sleep usefully, and cannot say "continue". The resume has to be
-delivered from *outside* the dead turn.
+refuse to stop and cannot say "continue". The resume has to arrive from *outside* the
+dead turn.
 
 ```mermaid
 flowchart TD
     A[Turn running] --> B{How did it end?}
-    B -->|normally| C[Stop fires<br/>hook could block here<br/>but there is nothing to fix]
+    B -->|normally| C[Stop fires — could block,<br/>but there is nothing to fix]
     B -->|API error| D[StopFailure fires<br/>output ignored, cannot block]
-    D --> E[Hook can only<br/>write down what happened]
+    D --> E[Hook can only write down<br/>what happened]
     E --> F[Something outside the turn<br/>has to say continue]
 ```
 
-## The flow, end to end
+## How it works
+
+Two halves. A resident relay that does nothing until spoken to, and a hook that only
+runs when something breaks.
 
 ```mermaid
 sequenceDiagram
     participant API
     participant CC as Claude Code
     participant Hook as watchdog.py hook
-    participant Disk as ~/.claude/watchdog
-    participant Ch as delivery channel
+    participant Sh as detached sh
+    participant Mon as monitor.sh<br/>(blocked on fifo)
     participant Claude
 
+    Note over Mon: idle: ~1–2 MB, 0 CPU,<br/>parked in read(2)
     API--xCC: stream dies
     CC->>Hook: StopFailure {error, message, session_id}
-    Hook->>Hook: armed? classify? under the retry cap?
-    Hook->>Disk: write <session>.resume {attempt, deliver_at}
+    Hook->>Hook: armed? retryable? under the cap?
+    Hook->>Sh: spawn: sleep <backoff>, then deliver
     Note over Hook: returns at once — never sleeps
-    Ch->>Disk: poll: is anything due?
-    Disk-->>Ch: yes, and claim it (atomic rename)
-    Ch->>Claude: "resume where you stopped"
+    Sh->>Mon: write the resume into the fifo
+    Mon->>Claude: relays it to stdout → arrives as a notification
     Claude->>API: continues the task
 ```
 
-Step by step:
+1. **The stream dies.** `StopFailure` fires with the error already classified:
+   `{"error": "server_error", "last_assistant_message": "API Error: The response stopped
+   arriving", "session_id": "…"}`.
+2. **The hook decides** — armed, retryable error, under the retry cap — writes one small
+   incident file and returns. It never sleeps: a hook whose output is thrown away gains
+   nothing by blocking the session.
+3. **A detached `sh` waits out the backoff.** During the wait the only cost is `sh` and
+   `sleep`, not a Python interpreter.
+4. **It writes the resume into a fifo**, which the resident `monitor.sh` is parked on.
+   Monitor stdout reaches Claude as a notification — the in-band way to wake a waiting
+   session.
+5. **Claude picks up** where it stopped, told to re-check anything that was mid-flight
+   rather than restart.
 
-1. **The stream dies.** Claude Code fires `StopFailure` with the error already
-   classified: `{"error": "server_error", "last_assistant_message": "API Error: The
-   response stopped arriving", "session_id": "…"}`.
-2. **The hook decides.** Armed? Is this error type worth retrying? Still under the cap?
-   If yes it writes one small file, `<session-id>.resume`, stamped with `deliver_at =
-   now + backoff`. It returns immediately — sleeping in a hook whose output is thrown
-   away would only stall the session.
-3. **A channel picks it up** once `deliver_at` passes, claiming it with an atomic
-   rename so two channels can never resume the same turn twice.
-4. **Claude gets a message** saying the turn was cut off mid-work: pick up where it
-   stopped, re-check anything that was in flight, don't restart.
+### Finding the right session, without calling the CLI
+
+Both halves need to agree on one fifo. They walk up their own process tree with `ps`
+until they find the owning `claude` process, and name the fifo after its pid. The hook
+is spawned by that same process, so both sides land on the same answer without either
+shelling out to `claude agents --json` (which would start a second Node process on every
+API error).
+
+The command *name* is compared exactly. Searching the whole argv for "claude" looks
+equivalent and is not: any ancestor shell whose command line merely mentions such a path
+matches, and the walk stops on the shell. That bug shipped once and is now a test.
 
 ## Delivery without tmux
 
-The default channel needs no tmux and no terminal tricks. Plugin monitors run a
-background command whose **stdout lines are delivered to Claude as notifications** —
-that is the in-band way to reach a waiting session.
-
 ```mermaid
 flowchart LR
-    Q[queued resume] --> M{monitor<br/>heartbeat fresh?}
-    M -->|yes| MON["monitor prints the resume line<br/>→ arrives as a notification<br/><b>no tmux needed</b>"]
+    D[resume due] --> M{monitor parked<br/>on the fifo?}
+    M -->|yes| MON["write to fifo → monitor relays it<br/><b>default, needs nothing</b>"]
     M -->|no| T{session inside<br/>a tmux pane?}
-    T -->|yes| TMUX["tmux send-keys 'continue'<br/>typed into the pane"]
-    T -->|no| N["bell + desktop notification<br/>honest: nothing can type for you"]
+    T -->|yes| TMUX["tmux send-keys 'continue'"]
+    T -->|no| N["desktop notification + bell<br/>honest: nothing can type for you"]
 ```
 
-| Channel | Needs | When it's used |
+| Channel | Needs | When |
 | --- | --- | --- |
-| `monitor` | nothing | default, whenever the monitor's heartbeat is fresh |
-| `tmux` | tmux | monitor missing (plugin just installed, session not restarted) |
-| notify | nothing | neither available — it says so instead of pretending |
+| `monitor` | nothing | default, whenever the monitor is listening |
+| `tmux` | tmux | monitor missing — e.g. session not restarted since install |
+| notify | nothing | neither available; it says so instead of pretending |
 
-The monitor writes a heartbeat every poll, so the hook can tell whether the in-band
-channel is actually alive rather than assuming it. Force one with
-`watchdog set channel monitor` (or `tmux`).
+Availability is not guessed: the sender opens the fifo `O_WRONLY|O_NONBLOCK` and `ENXIO`
+means no monitor is listening. `monitor.sh` therefore holds the fifo **`O_RDWR`**, not
+read-only — on Darwin a reader merely parked in `open(2)` does not satisfy that
+non-blocking open, so a read-only monitor is invisible and every resume silently falls
+back to tmux. Force a channel with `watchdog set channel monitor` (or `tmux`).
 
 ## What it retries
 
-The `error` field from `StopFailure` drives the decision, and the message text is
-checked *first*.
+The `error` field drives the decision, and the message text is checked *first*.
 
 ```mermaid
 flowchart TD
@@ -122,70 +137,89 @@ flowchart TD
     T -->|no| Y{error in<br/>fatal_types?}
     Y -->|"auth · billing · model_not_found<br/>invalid_request · max_output_tokens"| F
     Y -->|no| R{error in<br/>retry_types?}
-    R -->|"rate_limit · overloaded<br/>server_error · unknown"| G[queue a resume]
+    R -->|"rate_limit · overloaded<br/>server_error · unknown"| G[schedule a resume]
     R -->|anything else| S[report it, don't retry]
 ```
 
-Text before type, because a spent quota arrives as `rate_limit` — retrying that for an
-hour in 60-second steps is pointless. An error type in neither list is reported and
-**not** retried; widening the list is your call, and it's one command.
+Text before type, because a spent quota arrives as `rate_limit` — retrying that hourly in
+60-second steps is pointless. An error type in neither list is reported and **not**
+retried.
 
-Backoff `5 → 15 → 30 → 60 → 120s`, with a 60s floor for rate limits and overload,
-capped at 8 retries per session. Counters reset after 12 idle hours.
+Backoff `5 → 15 → 30 → 60 → 120s`, 60s floor for rate limits and overload, 8 retries per
+session, counter resets after 12 idle hours.
 
-## What it costs
+## Requirements
 
-The machinery is free. The retry is not — it costs exactly what typing `continue`
-yourself costs, because it *is* that.
+No packages, no runtime to install, nothing compiled.
+
+| Needs | Where it's used | Notes |
+| --- | --- | --- |
+| POSIX `sh` | the resident monitor | verified under both `dash` and bash-as-`sh` |
+| `ps`, `mkfifo`, `tr` | session correlation, the fifo | base system on macOS and Linux |
+| `python3` | hook, delivery, CLI — never resident | present on any machine with a dev toolchain |
+| `tmux` | fallback channel only | optional |
+| `osascript` / `notify-send` | last-resort notification | optional; falls back to a bell |
+
+`watchdog doctor` prints this as a checklist for the machine you're on.
+
+## Footprint
+
+Measured on macOS, 4 seconds after start, idle:
+
+| | Resident | CPU while idle | Wakeups |
+| --- | --- | --- | --- |
+| First version (Python, polling) | 18.4 MB | timer every 2s | ~30/min |
+| **Now (`sh` on a fifo)** | **1.3 MB** (dash) / 2.1 MB (bash-as-sh) | **0.00s** | **none** |
+
+Two changes got the 10×, and neither was a faster language:
+
+- **The interpreter left the resident path.** CPython's floor is 14.5 MB before your code
+  exists (`python3 -c pass`), so no amount of optimising a Python daemon gets near 2 MB.
+  `sh -c :` is 1.9 MB.
+- **The poll became a block.** There is no interval and no heartbeat file. The monitor is
+  parked in `read(2)` on a fifo and the kernel wakes it when a resume is written; a
+  heartbeat *file* would mean timers, and a heartbeat *line* would cost tokens, since
+  every line a monitor prints becomes a notification.
+
+**Why not Rust?** A static Rust binary would land near 1 MB — perhaps 0.3–1 MB below
+`dash`, both rounding to nothing against the session that hosts it. In exchange the
+plugin would need per-platform binaries committed to the repo or a `cargo build` on
+install, replacing "clone it and it runs". The win here came from deleting work, not from
+changing language, so the language stays boring on purpose.
+
+## What it costs in tokens
 
 | Part | Model calls | Token cost |
 | --- | --- | --- |
-| `StopFailure` hook | none | **zero** — plain Python, runs and exits |
-| Monitor while idle | none | **zero** — see below |
-| One delivered resume | one new turn | one turn's input + output, same as typing `continue` |
+| `StopFailure` hook | none | **zero** |
+| Monitor while idle | none | **zero** — it prints nothing |
+| One delivered resume | one new turn | same as typing `continue` yourself |
 
-Idle really is zero, by design: the monitor's liveness signal is a **file touch, not a
-stdout line**. Every line a monitor prints becomes a notification in the conversation,
-so a heartbeat printed to stdout would quietly add tokens every few seconds, all night,
-forever. It writes to disk instead and only ever prints when there is a resume to
-deliver.
-
-What is not free is the retry itself. Resuming re-sends the conversation, so a retry on
-a large context is a large input — mostly prompt-cache reads if the retry lands inside
-the cache window, which the 5–120s backoff is chosen to stay inside. The cost that
-actually bites is a **failed** retry: 8 attempts that all die is 8 turns of input for
-no progress. Three things bound it:
-
-- the retry cap (`max_retries`, default 8),
-- the fatal lists, which refuse the errors that would fail identically every time,
-- and `unknown` being the one speculative entry in `retry_types` — it is there so a
-  genuinely transient error nobody has catalogued still recovers. If you would rather
-  not pay for guesses, remove it:
+The expense is a *failed* retry: 8 attempts that all die is 8 turns of input for no
+progress. The cap, the backoff and the fatal lists exist to bound that. `unknown` is the
+one speculative entry in `retry_types` — it's there so an uncatalogued transient error
+still recovers. To stop paying for guesses:
 
 ```sh
 watchdog set retry_types rate_limit,overloaded,server_error
-watchdog set max_retries 3     # cheaper ceiling on a huge context
+watchdog set max_retries 3
 ```
-
-Every attempt is logged with its cost driver (attempt number and error), so
-`watchdog log` tells you whether retries are recovering work or burning context.
 
 ## Configuration
 
-Every knob is a config key. Precedence: **`WATCHDOG_<KEY>` env var → config file → default.**
+Precedence: **`WATCHDOG_<KEY>` env var → config file → default.**
 
 ```sh
-watchdog config                              # effective values, changed ones marked
+watchdog config                  # effective values, changed ones marked
 watchdog set max_retries 20
-watchdog set backoff 10,30,60                # lists take commas
-watchdog set retry_types server_error,overloaded,unknown
-watchdog set channel monitor                 # auto | monitor | tmux
+watchdog set backoff 10,30,60    # lists take commas
+watchdog set channel monitor     # auto | monitor | tmux
 watchdog set resume_message "keep going ({attempt}/{max_retries})"
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `false` | armed or not (`watchdog on` / `watchdog off`) |
+| `enabled` | `false` | armed or not (`watchdog on` / `off`) |
 | `max_retries` | `8` | retries per session before giving up |
 | `backoff` | `[5,15,30,60,120]` | seconds per attempt; last value repeats |
 | `slow_floor` | `60` | minimum wait for `slow_types` |
@@ -194,70 +228,69 @@ watchdog set resume_message "keep going ({attempt}/{max_retries})"
 | `fatal_types` | auth, oauth, billing, invalid_request, model_not_found, max_output_tokens | never retried |
 | `fatal_text` | usage limit reached, credit balance, … | message substrings that veto a retry |
 | `channel` | `auto` | `auto`, `monitor`, or `tmux` |
-| `poll_seconds` | `2` | monitor poll interval |
-| `heartbeat_stale` | `30` | seconds before the monitor counts as down |
 | `counter_ttl_hours` | `12` | idle time before the retry counter resets |
-| `resume_message` | see `watchdog config` | template: `{attempt} {max_retries} {error} {message}` |
+| `resume_message` | see `watchdog config` | `{attempt} {max_retries} {error} {message}` |
 
-Config and state live in `~/.claude/watchdog/` (override with `WATCHDOG_HOME`), so updating or
-reinstalling the plugin keeps your settings, counters, and log.
+State lives in `~/.claude/watchdog/` (override with `WATCHDOG_HOME`), so reinstalling the
+plugin keeps your settings, counters and log.
 
-Plugin `userConfig` is deliberately not used: those values reach hooks but **not**
-monitors, which would leave the two halves disagreeing about the same setting.
+Plugin `userConfig` is deliberately unused: those values reach hooks but **not** monitors,
+which would leave the two halves disagreeing about one setting.
 
 ## Commands
 
 ```
-/watchdog                 # doctor: which channel is live, per session
+/watchdog                # doctor: requirements, listening monitors, pending resumes
 /watchdog on | off
 ```
 
-`watchdog` is also on the Bash tool's PATH while the plugin is enabled, and works from your
-own shell:
+`watchdog` is also on the Bash tool's PATH while the plugin is enabled, and works from
+your own shell:
 
 ```sh
-watchdog doctor           # armed? monitor up? tmux reachable? anything queued?
+watchdog doctor
 watchdog log 20
-watchdog reset            # clear counters, queued resumes, heartbeats
-watchdog test             # 53 checks
+watchdog reset           # clear counters and pending resumes
+watchdog test            # 61 checks
 ```
-
-Start with `watchdog doctor`. If a session shows `would use: none - cannot resume`, restart
-it so the monitor comes up.
 
 ## Files
 
 ```
-scripts/watchdog.py       everything: hook, monitor, tmux sender, doctor, config
-bin/watchdog              two-line shim onto that script
-hooks/hooks.json     StopFailure → watchdog.py hook
-monitors/monitors.json  watchdog-resume → watchdog.py monitor
-commands/watchdog.md      /watchdog
-tests/test_watchdog.py    53 checks
+scripts/monitor.sh      resident relay: POSIX sh parked on a fifo
+scripts/watchdog.py     hook, delivery, doctor, config — only runs on demand
+hooks/hooks.json        StopFailure → watchdog.py hook
+monitors/monitors.json  watchdog-resume → monitor.sh
+commands/watchdog.md    /watchdog
+tests/test_watchdog.py  61 checks
 ```
 
 ## Verified vs not
 
-Verified on macOS, Claude Code 2.1.234:
+On macOS, Claude Code 2.1.234:
 
-- `Stop` does **not** fire on an API error; `StopFailure` does. Probed with a real
-  failing turn and hooks on both events — not inferred from docs.
+- `Stop` does **not** fire on an API error; `StopFailure` does. Probed with a real failing
+  turn and hooks on both events, not inferred from docs.
 - The `StopFailure` payload shape above, including the classified `error` field.
-- **Monitor stdout reaches Claude as a notification** — armed a background monitor,
-  and its line arrived as a live notification 150s later.
-- tmux delivery end to end: pane resolved by walking the process tree from session pid
-  to `pane_pid`, `continue\n` landed on the target program's stdin, request drained once.
-- Classification, backoff, cap, per-session counters, single-claim race, config
-  precedence, malformed input: 53 checks, and 14 deliberate mutations of the source are
-  each caught by them.
+- **The whole no-tmux path, end to end**: `monitor.sh` running, a real `StopFailure`
+  payload into the hook, the resume text arriving on the monitor's stdout — under `dash`
+  and under bash-as-`sh`.
+- Monitor stdout reaching Claude as a notification, confirmed separately in a live session.
+- tmux delivery end to end: pane resolved by walking the process tree, `continue\n` landed
+  on the target program's stdin.
+- Session correlation resolving the same pid `claude agents --json` reports.
+- Footprint numbers in the table above.
+- 61 checks in `tests/test_watchdog.py`; 16 deliberate mutations of the source are each
+  caught by them.
 
-Not verified: a live `The response stopped arriving` — it can't be triggered on demand,
-so the error type it maps to is inferred (`server_error` and `unknown` are both in the
-retry list, which is why both are there).
+Not verified: Linux at runtime — the shell is checked under `dash` and every tool used is
+base-system, but the plugin has not been exercised on a Linux host. A live
+`The response stopped arriving` cannot be triggered on demand either, so which `error`
+type it maps to is inferred; `server_error` and `unknown` are both retryable, which is why
+both are in the list.
 
 For a fully unattended run with no TUI at all, a `claude -p --resume` retry loop is
-sturdier than any in-session mechanism. This plugin is for leaving a live session
-working overnight.
+sturdier than any in-session mechanism. This plugin is for leaving a live session working.
 
 ## License
 

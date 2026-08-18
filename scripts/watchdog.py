@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Watchdog: resume a Claude Code turn that an API error killed.
 
-An API error ends a turn without firing Stop, so no hook can refuse the stop.
-Only StopFailure fires, and its output is discarded -- so the resume has to be
-delivered from outside the turn. This one file is the whole plugin:
+Runs only when something has gone wrong, so it can afford to be a Python script.
+The half that stays resident for the whole session is monitor.sh, which is POSIX
+sh blocked in open(2) on a fifo -- see that file.
 
-    watchdog.py hook        StopFailure hook: classify, back off, queue a resume
-    watchdog.py monitor     delivery via monitor stdout (in band, no tmux needed)
-    watchdog.py deliver ID  delivery by typing into a tmux pane (fallback)
-    watchdog.py doctor      which channel would fire right now
+    watchdog.py hook            StopFailure hook: classify, then schedule a resume
+    watchdog.py deliver SID     write the resume into the session (fifo, else tmux)
+    watchdog.py doctor          platform preflight and per-session channel
     watchdog.py on|off|status|log|reset|config|set
 """
 
+import errno
 import json
 import os
 import subprocess
@@ -33,15 +33,13 @@ DEFAULTS = {
         "authentication_failed", "oauth_org_not_allowed", "billing_error",
         "invalid_request", "model_not_found", "max_output_tokens",
     ],
-    # Checked before the type: a spent quota arrives as rate_limit but retrying
+    # Checked before the type: a spent quota arrives as rate_limit, but retrying
     # it for an hour in 60s steps is pointless.
     "fatal_text": [
         "usage limit reached", "credit balance", "prompt is too long",
         "exceeds the maximum", "failed to authenticate",
     ],
     "channel": "auto",
-    "poll_seconds": 2,
-    "heartbeat_stale": 30,
     "counter_ttl_hours": 12,
     "resume_message": (
         "The previous turn did not finish: it was cut off by a transient API error "
@@ -53,16 +51,30 @@ DEFAULTS = {
     ),
 }
 
-# Every key is settable as WATCHDOG_<KEY>; lists take commas, JSON is tried first.
+
 def _coerce(default, raw):
+    """Env vars arrive as strings; lists also accept a comma-separated form."""
     try:
         val = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         val = raw
     if isinstance(default, bool):
         return val not in (False, 0, "", "0", "false", "no", "off")
-    if isinstance(default, list) and isinstance(val, str):
-        return [p.strip() for p in val.split(",") if p.strip()]
+    if isinstance(default, list):
+        if isinstance(val, str):
+            val = [p.strip() for p in val.split(",") if p.strip()]
+        elif not isinstance(val, list):
+            val = [val]
+        # A numeric list stays numeric, or comparisons against it explode later.
+        if default and all(isinstance(d, int) for d in default):
+            out = []
+            for item in val:
+                try:
+                    out.append(int(item))
+                except (TypeError, ValueError):
+                    return default
+            return out or default
+        return [str(item) for item in val] or default
     if isinstance(default, int) and not isinstance(default, bool):
         try:
             return int(val)
@@ -93,7 +105,6 @@ def save_config(updates):
         pass
     stored.update(updates)
     CONFIG_FILE.write_text(json.dumps(stored, indent=2) + "\n")
-    return stored
 
 
 def log(msg):
@@ -105,56 +116,78 @@ def log(msg):
         pass
 
 
-def _safe(name):
-    return "".join(c for c in (name or "") if c.isalnum() or c in "-_") or "unknown"
-
-
-def _path(session_id, suffix):
+def _path(name, suffix):
     HOME.mkdir(parents=True, exist_ok=True)
-    return HOME / f"{_safe(session_id)}.{suffix}"
+    safe = "".join(c for c in (name or "") if c.isalnum() or c in "-_") or "unknown"
+    return HOME / f"{safe}.{suffix}"
 
 
-def attempts(session_id, cfg):
-    p = _path(session_id, "attempts")
+# ------------------------------------------------------------- correlation ----
+def _ps(pid, fmt):
     try:
-        if time.time() - p.stat().st_mtime > cfg["counter_ttl_hours"] * 3600:
-            return 0
-        return int(p.read_text().strip() or 0)
-    except (OSError, ValueError):
-        return 0
+        return subprocess.run(["ps", "-o", fmt, "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
 
 
-def monitor_alive(session_id, cfg, now=None):
-    now = time.time() if now is None else now
+def claude_pid():
+    """The owning claude process, found by walking up from here with ps.
+
+    monitor.sh walks the same way from its own pid, so both sides agree on the
+    fifo path without either shelling out to the claude CLI.
+
+    The command *name* is compared exactly. Searching the full argv for "claude"
+    instead looks tempting and is wrong: any ancestor shell whose command line
+    merely mentions a path containing the word -- including this repository --
+    matches, and the walk stops on the shell instead of the session. The argv is
+    consulted only for a runtime that hosts claude under its own name.
+    """
+    pid = os.getpid()
+    for _ in range(12):
+        parent = _ps(pid, "ppid=")
+        if not parent.isdigit() or int(parent) <= 1:
+            return None
+        parent = int(parent)
+        name = Path(_ps(parent, "comm=").strip() or "?").name.lower()
+        if name == "claude":
+            return parent
+        if name in ("node", "bun", "deno") and "claude" in _ps(parent, "args=").lower():
+            return parent
+        pid = parent
+    return None
+
+
+def fifo_for(owner_pid):
+    return HOME / f"{owner_pid}.resume"
+
+
+def fifo_reader_present(owner_pid):
+    """True when monitor.sh is blocked on the fifo. ENXIO means nobody is reading."""
+    path = fifo_for(owner_pid)
     try:
-        return now - _path(session_id, "monitor").stat().st_mtime < cfg["heartbeat_stale"]
+        fd = os.open(str(path), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        return exc.errno not in (errno.ENXIO, errno.ENOENT)
+    os.close(fd)
+    return True
+
+
+def fifo_write(owner_pid, text):
+    try:
+        fd = os.open(str(fifo_for(owner_pid)), os.O_WRONLY | os.O_NONBLOCK)
     except OSError:
         return False
-
-
-def read_request(session_id):
     try:
-        return json.loads(_path(session_id, "resume").read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def claim(session_id):
-    """Atomic take, so monitor and tmux can never both resume one turn."""
-    src = _path(session_id, "resume")
-    dst = _path(session_id, "claimed")
-    try:
-        src.rename(dst)
+        os.write(fd, (text.replace("\n", " ") + "\n").encode())
+        return True
     except OSError:
-        return None
-    try:
-        req = json.loads(dst.read_text())
-    except (OSError, json.JSONDecodeError):
-        req = None
-    dst.unlink(missing_ok=True)
-    return req
+        return False
+    finally:
+        os.close(fd)
 
 
+# ------------------------------------------------------------------ policy ----
 def classify(error_type, message, cfg):
     """(verdict, detail) where verdict is retry | fatal | unrecognised."""
     error_type = (error_type or "unknown").strip()
@@ -170,31 +203,31 @@ def classify(error_type, message, cfg):
 
 
 def backoff(attempt, error_type, cfg):
-    steps = cfg["backoff"] or DEFAULTS["backoff"]
+    steps = cfg["backoff"] if isinstance(cfg["backoff"], list) and cfg["backoff"] else DEFAULTS["backoff"]
     delay = steps[min(max(attempt, 1) - 1, len(steps) - 1)]
     if error_type in cfg["slow_types"]:
         delay = max(delay, cfg["slow_floor"])
     return delay
 
 
-def resume_text(req, cfg):
-    return cfg["resume_message"].format(
-        error=req.get("error", "unknown"), message=(req.get("message") or "")[:200],
-        attempt=req.get("attempt"), max_retries=req.get("max_retries"),
-    )
-
-
-def sessions():
+def attempts(session_id, cfg):
+    p = _path(session_id, "attempts")
     try:
-        out = subprocess.run(["claude", "agents", "--json"],
-                             capture_output=True, text=True, timeout=20).stdout
-        rows = json.loads(out)
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
+        if time.time() - p.stat().st_mtime > cfg["counter_ttl_hours"] * 3600:
+            return 0
+        return int(p.read_text().strip() or 0)
+    except (OSError, ValueError):
+        return 0
 
 
-# ---------------------------------------------------------------- hook --------
+def resume_text(incident, cfg):
+    return cfg["resume_message"].format(
+        error=incident.get("error", "unknown"),
+        message=(incident.get("message") or "")[:200],
+        attempt=incident.get("attempt"), max_retries=incident.get("max_retries"))
+
+
+# -------------------------------------------------------------------- hook ----
 def cmd_hook():
     try:
         payload = json.load(sys.stdin)
@@ -224,105 +257,53 @@ def cmd_hook():
         print(json.dumps({"systemMessage": f"watchdog: gave up after {cfg['max_retries']} retries."}))
         return
 
+    owner = claude_pid()
     _path(sid, "attempts").write_text(str(n))
-    delay = backoff(n, error, cfg)
-    _path(sid, "resume").write_text(json.dumps({
-        "session_id": sid, "error": error, "message": message, "attempt": n,
-        "max_retries": cfg["max_retries"], "delay": delay,
-        "deliver_at": time.time() + delay,
+    _path(sid, "incident").write_text(json.dumps({
+        "session_id": sid, "error": error, "message": message,
+        "attempt": n, "max_retries": cfg["max_retries"], "owner": owner,
     }))
 
+    delay = backoff(n, error, cfg)
     channel = cfg["channel"]
     if channel == "auto":
-        channel = "monitor" if monitor_alive(sid, cfg) else "tmux"
+        channel = "monitor" if owner and fifo_reader_present(owner) else "tmux"
     log(f"session={sid} retry={n}/{cfg['max_retries']} in {delay}s via {channel} ({detail})")
-    if channel == "tmux":
-        spawn_deliver(sid, delay)
+
+    # The wait happens in a detached sh, not here: a hook whose output is ignored
+    # gains nothing by blocking, and sleeping in sh costs a fraction of a Python
+    # interpreter for the duration.
+    try:
+        subprocess.Popen(
+            ["sh", "-c", f'sleep {int(delay)}; exec "$0" "$1" deliver "$2"',
+             sys.executable, str(Path(__file__).resolve()), sid],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        log(f"session={sid} could not schedule delivery: {exc}")
+
     print(json.dumps({"systemMessage": f"watchdog: retry {n}/{cfg['max_retries']} in {delay}s via {channel}."}))
 
 
-# ------------------------------------------------------------- monitor --------
-def cmd_monitor():
-    """Monitor stdout reaches Claude as a notification: the only in-band wake."""
-    cfg = config()
-    sid, next_try = None, 0.0
-    while True:
-        now = time.time()
-        if not sid and now >= next_try:
-            sid = os.environ.get("WATCHDOG_SESSION_ID") or resolve_session()
-            next_try = now + 30
-            if sid:
-                log(f"monitor bound to session={sid}")
-        if sid:
-            cfg = config()
-            if cfg["enabled"]:
-                _path(sid, "monitor").touch()
-                req = read_request(sid)
-                if req and now >= req.get("deliver_at", 0):
-                    req = claim(sid)
-                    if req:
-                        log(f"session={sid} delivered via monitor")
-                        sys.stdout.write(resume_text(req, cfg) + "\n")
-                        sys.stdout.flush()
-        time.sleep(cfg["poll_seconds"])
-
-
-def _ps(pid, fmt):
-    try:
-        return subprocess.run(["ps", "-o", fmt, "-p", str(pid)],
-                              capture_output=True, text=True, timeout=5).stdout.strip()
-    except Exception:
-        return ""
-
-
-def resolve_session():
-    """Walk up to the owning claude process, then map its pid to a session id.
-
-    Guessing by working directory is deliberately avoided: two sessions in one
-    checkout would steal each other's resumes.
-    """
-    pid = os.getpid()
-    for _ in range(12):
-        parent = _ps(pid, "ppid=")
-        if not parent.isdigit() or int(parent) <= 1:
-            return None
-        if "claude" in _ps(parent, "comm=").lower():
-            return next((s["sessionId"] for s in sessions()
-                         if s.get("pid") == int(parent) and s.get("sessionId")), None)
-        pid = int(parent)
-    return None
-
-
-# ------------------------------------------------------------- deliver --------
-def spawn_deliver(session_id, delay):
-    try:
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "deliver",
-                          session_id, str(delay)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
-    except OSError as exc:
-        log(f"session={session_id} could not spawn deliverer: {exc}")
-
-
-def tmux_pane(session_id):
-    """The pane whose process tree contains this session's claude process."""
-    pid = next((s.get("pid") for s in sessions() if s.get("sessionId") == session_id), None)
-    if not pid:
+# ----------------------------------------------------------------- deliver ----
+def tmux_pane(owner_pid):
+    """The pane whose process tree contains the session, or None."""
+    if not owner_pid:
         return None
     try:
         if subprocess.run(["tmux", "info"], capture_output=True, timeout=5).returncode:
             return None
-        panes = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "{}\t{}".format("#{pane_pid}", "#{session_name}:#{window_index}.#{pane_index}")],
+        listing = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}:#{window_index}.#{pane_index}"],
             capture_output=True, text=True, timeout=10).stdout
     except Exception:
         return None
     owners = {}
-    for line in panes.splitlines():
+    for line in listing.splitlines():
         pane_pid, _, target = line.partition("\t")
         if pane_pid.strip().isdigit():
             owners[int(pane_pid.strip())] = target.strip()
-    probe = int(pid)
+    probe = int(owner_pid)
     for _ in range(12):
         if probe in owners:
             return owners[probe]
@@ -333,66 +314,101 @@ def tmux_pane(session_id):
     return None
 
 
-def cmd_deliver(session_id, delay):
-    time.sleep(float(delay))
-    req = claim(session_id)
-    if not req:
-        log(f"session={session_id} already claimed, tmux sender standing down")
-        return
-    pane = tmux_pane(session_id)
-    if pane:
-        # Text and Enter separately: one send-keys can submit before a busy TUI
-        # has finished accepting the text.
-        subprocess.run(["tmux", "send-keys", "-t", pane, "-l", "continue"], check=False)
-        time.sleep(0.3)
-        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=False)
-        log(f"session={session_id} delivered via tmux pane {pane}")
-        return
-    log(f"session={session_id} NO channel (no monitor, no tmux pane) -- notified only")
-    subprocess.run(["osascript", "-e",
-                    'display notification "A turn stalled on an API error and needs a manual continue." '
-                    'with title "Claude Code Watchdog"'], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def notify(text):
+    """Best effort, and silent when the platform offers nothing."""
+    for argv in (["osascript", "-e", f'display notification "{text}" with title "Claude Code Watchdog"'],
+                 ["notify-send", "Claude Code Watchdog", text]):
+        try:
+            if subprocess.run(argv, capture_output=True, timeout=10).returncode == 0:
+                return
+        except Exception:
+            continue
+    sys.stderr.write("\a")
 
 
-# -------------------------------------------------------------- control -------
+def cmd_deliver(session_id):
+    cfg = config()
+    src = _path(session_id, "incident")
+    taken = _path(session_id, "delivering")
+    try:
+        src.rename(taken)                      # exactly once, even if two land
+        incident = json.loads(taken.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    taken.unlink(missing_ok=True)
+
+    owner = incident.get("owner")
+    text = resume_text(incident, cfg)
+    want = cfg["channel"]
+
+    if want in ("auto", "monitor") and owner and fifo_write(owner, text):
+        log(f"session={session_id} delivered via monitor")
+        return
+    if want in ("auto", "tmux"):
+        pane = tmux_pane(owner)
+        if pane:
+            # Text and Enter separately: a single send-keys can submit before a
+            # busy TUI has taken the text.
+            subprocess.run(["tmux", "send-keys", "-t", pane, "-l", "continue"], check=False)
+            time.sleep(0.3)
+            subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=False)
+            log(f"session={session_id} delivered via tmux pane {pane}")
+            return
+    log(f"session={session_id} no delivery channel available -- notified only")
+    notify("A turn stalled on an API error and needs a manual continue.")
+
+
+# ------------------------------------------------------------------ doctor ----
+def _which(name):
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = Path(d) / name
+        if p.exists() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
 def cmd_doctor():
     cfg = config()
-    rows = sessions()
-    tmux_up = False
-    try:
-        tmux_up = subprocess.run(["tmux", "info"], capture_output=True, timeout=5).returncode == 0
-    except Exception:
-        pass
     print(f"enabled:     {'yes' if cfg['enabled'] else 'no   (run: watchdog on)'}")
     print(f"state:       {HOME}")
     print(f"max retries: {cfg['max_retries']}   backoff: {cfg['backoff']}   channel: {cfg['channel']}")
-    print(f"tmux:        {'running' if tmux_up else 'not running'}")
-    print(f"sessions:    {len(rows)}")
-    now = time.time()
-    for r in rows:
-        sid = r.get("sessionId") or "?"
-        alive = monitor_alive(sid, cfg, now)
-        chan = "monitor" if alive else ("tmux" if tmux_pane(sid) else "none - cannot resume")
-        line = f"  {sid[:8]}  {r.get('status', '?'):5}  monitor={'up' if alive else 'down'}  would use: {chan}"
-        req = read_request(sid)
-        if req:
-            line += f"  [queued retry {req['attempt']}, due in {int(req['deliver_at'] - now)}s]"
-        print(line)
-    if rows and not any(monitor_alive(r.get("sessionId") or "", cfg, now) for r in rows):
-        print("\nNo monitor heartbeat: restart the session after installing "
-              "(monitors start at session start, interactive CLI only).")
+
+    print("\nrequirements")
+    for label, ok, note in [
+        ("sh", bool(_which("sh")), "runs the resident monitor"),
+        ("ps", bool(_which("ps")), "finds the owning session"),
+        ("mkfifo", bool(_which("mkfifo")), "the in-band channel"),
+        ("python3", True, "this script"),
+        ("tmux", bool(_which("tmux")), "optional fallback only"),
+        ("desktop notify", bool(_which("osascript") or _which("notify-send")), "optional, last resort"),
+    ]:
+        mark = "ok " if ok else ("--  " if "optional" in note else "MISSING")
+        print(f"  {mark} {label:15}{note}")
+
+    live = sorted(HOME.glob("*.resume"))
+    print(f"\nmonitors listening: {len(live)}")
+    for f in live:
+        pid = f.stem
+        reading = fifo_reader_present(pid) if pid.isdigit() else False
+        alive = bool(_ps(pid, "comm=")) if pid.isdigit() else False
+        state = "listening" if reading else ("session alive, monitor not reading" if alive else "stale, will be reused")
+        print(f"  pid {pid:<8} {state}")
+    pending = sorted(HOME.glob("*.incident"))
+    if pending:
+        print(f"\npending resumes: {', '.join(p.stem[:8] for p in pending)}")
+    if not live:
+        print("\nNo monitor is listening. Restart the session after installing:")
+        print("monitors start at session start, and only in an interactive session.")
 
 
+# ----------------------------------------------------------------- control ----
 def main(argv):
     cmd = argv[0] if argv else "status"
     cfg = config()
     if cmd == "hook":
         cmd_hook()
-    elif cmd == "monitor":
-        cmd_monitor()
-    elif cmd == "deliver":
-        cmd_deliver(argv[1], argv[2] if len(argv) > 2 else 0)
+    elif cmd == "deliver" and len(argv) > 1:
+        cmd_deliver(argv[1])
     elif cmd == "doctor":
         cmd_doctor()
     elif cmd == "on":
@@ -411,22 +427,21 @@ def main(argv):
         except OSError:
             print("nothing logged yet")
     elif cmd == "reset":
-        for suffix in ("attempts", "resume", "claimed", "monitor"):
-            for p in HOME.glob(f"*.{suffix}"):
+        for pattern in ("*.attempts", "*.incident", "*.delivering"):
+            for p in HOME.glob(pattern):
                 p.unlink(missing_ok=True)
-        print("counters, queued resumes and heartbeats cleared")
+        print("counters and pending resumes cleared")
     elif cmd == "config":
         for key in DEFAULTS:
-            mark = "" if cfg[key] == DEFAULTS[key] else "  <- changed"
+            mark = "" if cfg[key] == DEFAULTS[key] else "   <- changed"
             print(f"{key:18} {json.dumps(cfg[key])}{mark}")
         print(f"\nfile: {CONFIG_FILE}   override any key with WATCHDOG_<KEY>")
     elif cmd == "set" and len(argv) >= 3:
-        key = argv[1]
-        if key not in DEFAULTS:
-            print(f"unknown key {key!r}. See: watchdog config", file=sys.stderr)
+        if argv[1] not in DEFAULTS:
+            print(f"unknown key {argv[1]!r}. See: watchdog config", file=sys.stderr)
             return 1
-        save_config({key: _coerce(DEFAULTS[key], argv[2])})
-        print(f"{key} = {json.dumps(config()[key])}")
+        save_config({argv[1]: _coerce(DEFAULTS[argv[1]], argv[2])})
+        print(f"{argv[1]} = {json.dumps(config()[argv[1]])}")
     else:
         print("usage: watchdog {on|off|status|doctor|log [n]|reset|config|set KEY VALUE}",
               file=sys.stderr)
