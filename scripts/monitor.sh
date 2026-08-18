@@ -38,11 +38,13 @@ claude_pid() {
   return 1
 }
 
-owner=$(claude_pid) || exit 0
+# WATCHDOG_OWNER_PID short-circuits the walk. It exists for the test suite and for
+# any launcher whose process tree does not lead to a process named claude.
+owner=${WATCHDOG_OWNER_PID:-}
+[ -n "$owner" ] || owner=$(claude_pid) || exit 0
 mkdir -p "$DIR" || exit 0
 FIFO="$DIR/$owner.resume"
 
-trap 'rm -f "$FIFO"' EXIT HUP INT TERM
 rm -f "$FIFO"
 mkfifo "$FIFO" 2>/dev/null || exit 0
 
@@ -58,9 +60,39 @@ mkfifo "$FIFO" 2>/dev/null || exit 0
 # `read` is a builtin, so the steady state forks nothing and runs no timer: the
 # process sleeps in the kernel until a resume is written.
 exec 3<> "$FIFO" || exit 0
-while :; do
-  while IFS= read -r line <&3; do
-    [ -n "$line" ] && printf '%s\n' "$line"
-  done
-  sleep 1
+
+# A blocking read can never notice that the session died, and Claude Code does not
+# reap monitors when it is killed rather than shut down -- verified by killing a
+# session and finding its monitor reparented to init, still blocked. Without this
+# the plugin leaks one resident process per session, forever.
+#
+# So a ticker writes a token into our own fifo every CHECK seconds, and each token
+# is an opportunity to ask whether the owner is still there. That is one wakeup a
+# minute by default, which keeps the idle cost at rounding error while making the
+# process mortal.
+CHECK=${WATCHDOG_LIVENESS_SECONDS:-60}
+TICK='__watchdog_liveness__'
+
+( while :; do
+    sleep "$CHECK"
+    printf '%s\n' "$TICK" >&3 2>/dev/null || exit 0
+  done ) &
+ticker=$!
+
+# TERM is deliberately left at its default action. A shell blocked in `read`
+# defers a *trapped* signal until the read completes, and this read only completes
+# when a resume arrives -- so trapping TERM here makes the monitor unkillable by
+# the session-end signal, which is exactly how the pre-fix version leaked. EXIT
+# still runs the cleanup on a normal end, and a stale fifo is harmless anyway
+# because presence is detected by opening it, not by its existence.
+trap 'kill "$ticker" 2>/dev/null; rm -f "$FIFO"' EXIT HUP INT
+
+while IFS= read -r line <&3; do
+  case "$line" in
+    "$TICK")
+      kill -0 "$owner" 2>/dev/null || break
+      ;;
+    '') ;;
+    *)  printf '%s\n' "$line" ;;
+  esac
 done

@@ -237,6 +237,65 @@ for shell in ("sh", "dash"):
     check(f"monitor.sh parses under {shell}",
           subprocess.run([shell, "-n", str(MONITOR)], capture_output=True).returncode == 0)
 
+# --- the resident monitor, driven with an explicit owner -----------------
+def spawn_monitor(h, owner, liveness=1, shell="sh"):
+    out = Path(h) / "monitor.out"
+    fh = out.open("w")
+    env = dict(os.environ, WATCHDOG_HOME=str(h), WATCHDOG_OWNER_PID=str(owner),
+               WATCHDOG_LIVENESS_SECONDS=str(liveness))
+    proc = subprocess.Popen([shell, str(MONITOR)], stdout=fh, stderr=subprocess.STDOUT, env=env)
+    for _ in range(50):
+        if (Path(h) / f"{owner}.resume").exists():
+            break
+        time.sleep(0.1)
+    return proc, out
+
+
+h = home()
+owner = subprocess.Popen(["sh", "-c", "while :; do sleep 1; done"])
+mon, out = spawn_monitor(h, owner.pid)
+try:
+    check("monitor creates a fifo named for its owner", (Path(h) / f"{owner.pid}.resume").is_fifo())
+    os.environ["WATCHDOG_HOME"] = h
+    importlib.reload(w)
+    check("hook would see the monitor as listening", w.fifo_reader_present(owner.pid))
+    check("write reaches the monitor", w.fifo_write(owner.pid, "RELAYED LINE"))
+    time.sleep(1)
+    check("monitor relays it to stdout", "RELAYED LINE" in out.read_text(), out.read_text()[:200])
+    time.sleep(2.5)  # at least two liveness ticks
+    check("liveness ticks are never relayed", "__watchdog_liveness__" not in out.read_text(),
+          "a leaked tick would become a notification, and cost tokens on a timer")
+    check("monitor still alive while its owner is", mon.poll() is None)
+    owner.kill()
+    owner.wait()
+    deadline = time.time() + 10
+    while mon.poll() is None and time.time() < deadline:
+        time.sleep(0.2)
+    check("monitor exits once its owner is gone", mon.poll() is not None,
+          "regression: Claude Code does not reap monitors on a hard kill, so this must self-terminate")
+    check("monitor removes its fifo on exit", not (Path(h) / f"{owner.pid}.resume").exists())
+finally:
+    if mon.poll() is None:
+        mon.kill()
+    if owner.poll() is None:
+        owner.kill()
+
+h = home()
+owner = subprocess.Popen(["sh", "-c", "while :; do sleep 1; done"])
+mon, _ = spawn_monitor(h, owner.pid, liveness=300)
+try:
+    mon.terminate()
+    deadline = time.time() + 5
+    while mon.poll() is None and time.time() < deadline:
+        time.sleep(0.1)
+    check("SIGTERM kills a monitor parked on the fifo", mon.poll() is not None,
+          "regression: trapping TERM made it unkillable, because a shell defers a "
+          "trapped signal until the blocking read returns")
+finally:
+    if mon.poll() is None:
+        mon.kill()
+    owner.kill()
+
 # --- garbage in, no crash ------------------------------------------------
 h = home()
 for junk in ["not json at all", "{}", ""]:

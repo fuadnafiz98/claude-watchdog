@@ -391,7 +391,12 @@ def cmd_doctor():
         pid = f.stem
         reading = fifo_reader_present(pid) if pid.isdigit() else False
         alive = bool(_ps(pid, "comm=")) if pid.isdigit() else False
-        state = "listening" if reading else ("session alive, monitor not reading" if alive else "stale, will be reused")
+        if not alive:
+            state = "session gone -- run: watchdog reap"
+        elif reading:
+            state = "listening"
+        else:
+            state = "session alive, monitor not reading"
         print(f"  pid {pid:<8} {state}")
     pending = sorted(HOME.glob("*.incident"))
     if pending:
@@ -431,6 +436,45 @@ def main(argv):
             for p in HOME.glob(pattern):
                 p.unlink(missing_ok=True)
         print("counters and pending resumes cleared")
+    elif cmd == "reap":
+        # Monitors self-terminate on a liveness check, so this only matters for
+        # ones left by a version that could not, or by a kill during a check.
+        killed, cleaned = [], []
+        for fifo in HOME.glob("*.resume"):
+            if fifo.stem.isdigit() and not _ps(fifo.stem, "comm="):
+                fifo.unlink(missing_ok=True)
+                cleaned.append(fifo.stem)
+        try:
+            listing = subprocess.run(["ps", "-ax", "-o", "pid=,ppid=,args="],
+                                     capture_output=True, text=True, timeout=10).stdout
+        except Exception:
+            listing = ""
+        for line in listing.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 3 or "monitor.sh" not in parts[2]:
+                continue
+            pid, ppid = parts[0], parts[1]
+            if ppid != "1":                      # still owned by a live session
+                continue
+            try:
+                os.kill(int(pid), 15)
+                killed.append(int(pid))
+            except (OSError, ValueError):
+                pass
+        # A shell parked in `read` with a trapped TERM never processes it, which is
+        # how these survived in the first place. Escalate to what it cannot defer.
+        if killed:
+            time.sleep(1)
+            for pid in killed:
+                try:
+                    os.kill(pid, 0)
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+        killed = [str(pid) for pid in killed]
+        print(f"killed {len(killed)} orphaned monitor(s)" + (f": {', '.join(killed)}" if killed else ""))
+        if cleaned:
+            print(f"removed {len(cleaned)} stale fifo(s): {', '.join(cleaned)}")
     elif cmd == "config":
         for key in DEFAULTS:
             mark = "" if cfg[key] == DEFAULTS[key] else "   <- changed"
@@ -443,7 +487,7 @@ def main(argv):
         save_config({argv[1]: _coerce(DEFAULTS[argv[1]], argv[2])})
         print(f"{argv[1]} = {json.dumps(config()[argv[1]])}")
     else:
-        print("usage: watchdog {on|off|status|doctor|log [n]|reset|config|set KEY VALUE}",
+        print("usage: watchdog {on|off|status|doctor|log [n]|reset|reap|config|set KEY VALUE}",
               file=sys.stderr)
         return 1
     return 0

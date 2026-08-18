@@ -14,12 +14,14 @@ costs **~1–2 MB and zero CPU**, and tmux is optional.
 
 ## Install
 
-From inside a Claude Code session:
+```sh
+claude plugin marketplace add fuadnafiz98/claude-watchdog
+claude plugin install watchdog@claude-watchdog
+```
 
-```
-/plugin marketplace add fuadnafiz98/claude-watchdog
-/plugin install watchdog@claude-watchdog
-```
+or the same two steps as `/plugin marketplace add …` and `/plugin install …` inside a
+session. Note the nesting: it is `claude plugin marketplace`, not `claude marketplace`,
+which is not a subcommand and is silently treated as a prompt.
 
 Restart the session (monitors start at session start), then arm it:
 
@@ -29,6 +31,14 @@ Restart the session (monitors start at session start), then arm it:
 
 Off by default — auto-continuing is what you want overnight, not while you're watching.
 Run `/watchdog` to see whether the in-band channel is actually live.
+
+## When it actually fires
+
+Claude Code retries a transient API failure **itself** first — in a live test against an
+endpoint returning 529 it made ten attempts over about three minutes before giving up. The
+watchdog only sees what survives that, and only then starts its own backoff. So after an
+error you should expect minutes of Claude Code's own retrying, then the resume. It is not
+idle; `watchdog log` shows exactly when it took over.
 
 ## Why it isn't just a hook
 
@@ -169,17 +179,30 @@ Measured on macOS, 4 seconds after start, idle:
 | | Resident | CPU while idle | Wakeups |
 | --- | --- | --- | --- |
 | First version (Python, polling) | 18.4 MB | timer every 2s | ~30/min |
-| **Now (`sh` on a fifo)** | **1.3 MB** (dash) / 2.1 MB (bash-as-sh) | **0.00s** | **none** |
+| **Now (`sh` on a fifo)** | **2.3 MB** (relay + liveness ticker) | **0.00s** | **1/min** |
 
 Two changes got the 10×, and neither was a faster language:
 
 - **The interpreter left the resident path.** CPython's floor is 14.5 MB before your code
   exists (`python3 -c pass`), so no amount of optimising a Python daemon gets near 2 MB.
   `sh -c :` is 1.9 MB.
-- **The poll became a block.** There is no interval and no heartbeat file. The monitor is
-  parked in `read(2)` on a fifo and the kernel wakes it when a resume is written; a
-  heartbeat *file* would mean timers, and a heartbeat *line* would cost tokens, since
-  every line a monitor prints becomes a notification.
+- **The poll became a block.** There is no heartbeat file and no delivery interval. The
+  relay is parked in `read(2)` on a fifo and the kernel wakes it when a resume is written.
+  A heartbeat *line* was never an option either: every line a monitor prints becomes a
+  notification, so it would have cost tokens on a timer all night.
+
+The one remaining wakeup is a liveness tick, and it is not optional. **Claude Code does not
+reap monitors when a session is killed rather than shut down** — verified by killing a
+session and finding its monitor reparented to init, still blocked, leaking ~2 MB per
+session forever. A blocking read cannot notice that its owner died, so a ticker writes a
+private token into the fifo once a minute and each token is a chance to check. Tune or
+disable it with `WATCHDOG_LIVENESS_SECONDS`; `watchdog reap` clears orphans left by an
+older version.
+
+A related trap, also verified: a shell parked in `read` **defers a trapped signal** until
+the read returns, which never happens. Trapping `TERM` therefore made the monitor immune
+to the session-end signal, which is how it leaked in the first place. `TERM` is left at its
+default action deliberately, and cleanup runs from the `EXIT` trap.
 
 **Why not Rust?** A static Rust binary would land near 1 MB — perhaps 0.3–1 MB below
 `dash`, both rounding to nothing against the session that hosts it. In exchange the
@@ -234,6 +257,11 @@ watchdog set resume_message "keep going ({attempt}/{max_retries})"
 State lives in `~/.claude/watchdog/` (override with `WATCHDOG_HOME`), so reinstalling the
 plugin keeps your settings, counters and log.
 
+Two knobs are environment-only, because they belong to the resident shell rather than the
+policy: `WATCHDOG_LIVENESS_SECONDS` (default 60) and `WATCHDOG_OWNER_PID`, which
+short-circuits session detection for a launcher whose process tree does not lead to a
+process named `claude`.
+
 Plugin `userConfig` is deliberately unused: those values reach hooks but **not** monitors,
 which would leave the two halves disagreeing about one setting.
 
@@ -251,7 +279,8 @@ your own shell:
 watchdog doctor
 watchdog log 20
 watchdog reset           # clear counters and pending resumes
-watchdog test            # 61 checks
+watchdog reap            # kill orphaned monitors from a killed session
+watchdog test            # 70 checks
 ```
 
 ## Files
@@ -262,12 +291,38 @@ scripts/watchdog.py     hook, delivery, doctor, config — only runs on demand
 hooks/hooks.json        StopFailure → watchdog.py hook
 monitors/monitors.json  watchdog-resume → monitor.sh
 commands/watchdog.md    /watchdog
-tests/test_watchdog.py  61 checks
+tests/test_watchdog.py  70 checks
 ```
 
 ## Verified vs not
 
-On macOS, Claude Code 2.1.234:
+On macOS, Claude Code 2.1.234. The headline item is a real session, not a simulation:
+
+**Installed the plugin and drove a live interactive session** (in tmux, pointed at a local
+endpoint returning 529 so the failure was genuine). Claude Code retried ten times over
+three minutes, then:
+
+```
+⏺ API Error: 529 Overloaded ...
+✻ Churned for 3m 3s · 1 monitor still running
+⏺ Monitor event: "Turns killed by a transient API error"     ← the resume arrived in band
+✻ 529 Overloaded · Retrying in 4s · attempt 4/10             ← the turn was running again
+```
+
+```
+retry=1/2 in 2s via monitor (error type server_error)
+delivered via monitor
+retry=2/2 in 2s via monitor (error type server_error)
+delivered via monitor
+gave up after 2 attempts
+```
+
+That covers the whole chain on the default channel with no tmux delivery involved: real
+`StopFailure`, real classification (`server_error`), scheduling, fifo hand-off, the monitor
+relaying it, Claude resuming, the cap stopping the loop, and the state files cleaned up
+afterwards.
+
+Also verified:
 
 - `Stop` does **not** fire on an API error; `StopFailure` does. Probed with a real failing
   turn and hooks on both events, not inferred from docs.
@@ -280,8 +335,10 @@ On macOS, Claude Code 2.1.234:
   on the target program's stdin.
 - Session correlation resolving the same pid `claude agents --json` reports.
 - Footprint numbers in the table above.
-- 61 checks in `tests/test_watchdog.py`; 16 deliberate mutations of the source are each
-  caught by them.
+- The resident monitor: fifo naming, relaying, liveness ticks never reaching stdout,
+  exiting when its owner dies, and dying on `SIGTERM`.
+- 70 checks in `tests/test_watchdog.py`; 22 deliberate mutations (16 in the Python, 6 in
+  the shell) are each caught by them.
 
 Not verified: Linux at runtime — the shell is checked under `dash` and every tool used is
 base-system, but the plugin has not been exercised on a Linux host. A live
