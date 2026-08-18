@@ -1,0 +1,7 @@
+[
+  {
+    "name": "afk-resume",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/monitor.sh\"",
+    "description": "Turns killed by a transient API error"
+  }
+]

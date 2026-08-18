@@ -1,0 +1,15 @@
+{
+  "name": "claude-afk",
+  "description": "Keeps unattended Claude Code sessions running through transient API errors.",
+  "owner": {
+    "name": "fuadnafiz98",
+    "url": "https://github.com/fuadnafiz98"
+  },
+  "plugins": [
+    {
+      "name": "afk",
+      "source": "./",
+      "description": "Resumes a turn killed by a transient API error, so unattended runs do not stall until morning."
+    }
+  ]
+}
