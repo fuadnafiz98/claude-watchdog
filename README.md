@@ -11,9 +11,11 @@ until someone comes back and types `continue`.
 
 ## Install
 
-```sh
-claude marketplace add https://github.com/fuadnafiz98/claude-afk
-claude plugin install afk@claude-afk
+From inside a Claude Code session:
+
+```
+/plugin marketplace add fuadnafiz98/claude-afk
+/plugin install afk@claude-afk
 ```
 
 Then restart the session (monitors only start at session start) and turn it on:
@@ -21,6 +23,10 @@ Then restart the session (monitors only start at session start) and turn it on:
 ```
 /afk on
 ```
+
+Verify with `/afk`, which reports which delivery channel is actually live. Note that
+marketplaces are managed by the in-session `/plugin` command; `claude marketplace ...`
+is not a CLI subcommand.
 
 It is **off by default**. Auto-continuing is what you want overnight, not while you
 are watching.
