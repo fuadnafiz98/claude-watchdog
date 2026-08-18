@@ -26,9 +26,12 @@ DEFAULTS = {
     "enabled": False,
     "max_retries": 8,
     "backoff": [5, 15, 30, 60, 120],
-    "slow_floor": 60,
-    "slow_types": ["rate_limit", "overloaded"],
-    "retry_types": ["rate_limit", "overloaded", "server_error", "unknown"],
+    "retry_types": ["unknown"],
+    # Claude Code retries these on its own -- roughly ten attempts with its own
+    # backoff, visible as "Retrying in 4s - attempt 4/10" -- and only gives up once
+    # that loop is spent. A second retry loop stacked on top of it waits out a
+    # backoff the session has already served and resumes a turn nothing killed.
+    "claude_retry_types": ["rate_limit", "overloaded", "server_error"],
     "fatal_types": [
         "authentication_failed", "oauth_org_not_allowed", "billing_error",
         "invalid_request", "model_not_found", "max_output_tokens",
@@ -189,7 +192,7 @@ def fifo_write(owner_pid, text):
 
 # ------------------------------------------------------------------ policy ----
 def classify(error_type, message, cfg):
-    """(verdict, detail) where verdict is retry | fatal | unrecognised."""
+    """(verdict, detail) where verdict is retry | fatal | claude | unrecognised."""
     error_type = (error_type or "unknown").strip()
     low = (message or "").lower()
     hit = next((t for t in cfg["fatal_text"] if t in low), None)
@@ -197,17 +200,18 @@ def classify(error_type, message, cfg):
         return "fatal", f"known-fatal: message says {hit!r}"
     if error_type in cfg["fatal_types"]:
         return "fatal", f"known-fatal error type {error_type}"
+    # retry_types is asked first so that putting a type back in it is enough to opt
+    # into resuming it, without also having to take it out of claude_retry_types.
     if error_type in cfg["retry_types"]:
         return "retry", f"error type {error_type}"
+    if error_type in cfg["claude_retry_types"]:
+        return "claude", f"Claude Code retries {error_type} itself"
     return "unrecognised", f"unrecognised error type {error_type!r}"
 
 
-def backoff(attempt, error_type, cfg):
+def backoff(attempt, cfg):
     steps = cfg["backoff"] if isinstance(cfg["backoff"], list) and cfg["backoff"] else DEFAULTS["backoff"]
-    delay = steps[min(max(attempt, 1) - 1, len(steps) - 1)]
-    if error_type in cfg["slow_types"]:
-        delay = max(delay, cfg["slow_floor"])
-    return delay
+    return steps[min(max(attempt, 1) - 1, len(steps) - 1)]
 
 
 def attempts(session_id, cfg):
@@ -251,7 +255,7 @@ def cmd_hook():
     if verdict != "retry":
         _path(sid, "attempts").unlink(missing_ok=True)
         log(f"session={sid} not resuming: {detail}")
-        tail = "" if verdict == "fatal" else " Report it if it was in fact transient."
+        tail = " Report it if it was in fact transient." if verdict == "unrecognised" else ""
         print(json.dumps({"systemMessage": f"watchdog: not resuming, {detail}.{tail}"}))
         return
 
@@ -269,7 +273,7 @@ def cmd_hook():
         "attempt": n, "max_retries": cfg["max_retries"], "owner": owner,
     }))
 
-    delay = backoff(n, error, cfg)
+    delay = backoff(n, cfg)
     channel = cfg["channel"]
     if channel == "auto":
         channel = "monitor" if owner and fifo_reader_present(owner) else "tmux"

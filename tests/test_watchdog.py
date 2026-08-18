@@ -38,7 +38,7 @@ def run(args, h, stdin="", **env):
                           capture_output=True, text=True, env=e, timeout=30)
 
 
-def hook(h, error="server_error", message="API Error: The response stopped arriving",
+def hook(h, error="unknown", message="API Error: The response stopped arriving",
          sid="s1", **env):
     payload = {"session_id": sid, "hook_event_name": "StopFailure", "error": error,
                "last_assistant_message": message, "cwd": "/tmp"}
@@ -99,17 +99,30 @@ check("unknown type not retried", incident(h) is None, out)
 check("unknown type flagged unrecognised",
       "unrecognised" in msg(out) and "known-fatal" not in msg(out), msg(out))
 
-# --- backoff, floor, cap ----------------------------------------------------
+# --- what Claude Code retries itself ----------------------------------------
+# Its own loop runs ~10 attempts before the turn dies, so a resume here would be
+# a second retry loop over an error that was already retried and lost.
+for etype in ["rate_limit", "overloaded", "server_error"]:
+    h = home()
+    out, _ = hook(h, error=etype, message="API Error: 529 Overloaded")
+    check(f"left to Claude Code: {etype}", incident(h) is None, out)
+    check(f"says Claude Code owns it: {etype}",
+          "Claude Code retries" in msg(out), msg(out))
+    check(f"not asked to be reported: {etype}", "Report it" not in msg(out), msg(out))
+
+h = home()
+out, _ = hook(h, error="overloaded", WATCHDOG_RETRY_TYPES="unknown,overloaded")
+check("retry_types re-opts into a type Claude Code owns", incident(h) is not None, out)
+
+# --- backoff, cap -----------------------------------------------------------
 import watchdog as w  # noqa: E402
 os.environ["WATCHDOG_HOME"] = home()
 importlib.reload(w)
 cfg = w.config()
-check("backoff escalates", [w.backoff(i, "server_error", cfg) for i in range(1, 7)]
+check("backoff escalates", [w.backoff(i, cfg) for i in range(1, 7)]
       == [5, 15, 30, 60, 120, 120])
-check("rate_limit floors at 60s", w.backoff(1, "rate_limit", cfg) == 60)
-check("overloaded floors at 60s", w.backoff(1, "overloaded", cfg) == 60)
 check("a broken backoff list falls back",
-      w.backoff(1, "server_error", dict(cfg, backoff=7)) == 5, "non-list must not crash")
+      w.backoff(1, dict(cfg, backoff=7)) == 5, "non-list must not crash")
 
 h = home()
 for _ in range(8):
