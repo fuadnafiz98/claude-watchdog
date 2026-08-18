@@ -70,9 +70,9 @@ jobs:
           sys.exit(1 if problems else 0)
           PY
       - name: claude plugin validate
-        # Advisory: the CLI is the authority on the schema, but it is a network
-        # install and may need more than a checkout, so it must not gate a merge.
-        continue-on-error: true
+        # The CLI is the authority on the schema, and it needs nothing but a
+        # checkout to run -- no auth, no config. Deliberately unpinned: what must
+        # pass is the version users are actually installing with.
         run: npx -y @anthropic-ai/claude-code@latest plugin validate .
 
   plugin:
@@ -90,7 +90,6 @@ jobs:
             sh -n "$f" && dash -n "$f" && echo "ok $f"
           done
       - name: claude plugin validate
-        continue-on-error: true
         run: npx -y @anthropic-ai/claude-code@latest plugin validate ${{ matrix.plugin }}
       - name: tests
         run: |
