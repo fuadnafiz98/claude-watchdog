@@ -1,0 +1,105 @@
+name: ci
+
+# Every plugin in the repository is discovered from its manifest, so a new plugin
+# directory is tested and validated without touching this file.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      plugins: ${{ steps.find.outputs.plugins }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        run: |
+          plugins=$(find . -mindepth 2 -maxdepth 3 -path './.git' -prune -o \
+            -name plugin.json -path '*/.claude-plugin/*' -print \
+            | sed 's|^\./||; s|/.claude-plugin/plugin.json$||' | sort | jq -R . | jq -sc .)
+          echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
+          echo "found: $plugins"
+
+  marketplace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: manifests parse, and say what they claim
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+
+          mp = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text())
+          for field in ("name", "owner", "plugins"):
+              assert field in mp, f"marketplace.json is missing {field!r}"
+          assert mp["name"] == mp["name"].lower().strip(), "marketplace name must be kebab-case"
+
+          seen = set()
+          problems = []
+          for entry in mp["plugins"]:
+              name, src = entry.get("name"), entry.get("source")
+              if not name or not src:
+                  problems.append(f"entry needs name and source: {entry}")
+                  continue
+              if name in seen:
+                  problems.append(f"duplicate plugin name {name!r}")
+              seen.add(name)
+              if not isinstance(src, str):
+                  continue                        # remote source, nothing local to check
+              if ".." in src:
+                  problems.append(f"{name}: source escapes the repository: {src!r}")
+                  continue
+              manifest = pathlib.Path(src) / ".claude-plugin" / "plugin.json"
+              if not manifest.exists():
+                  problems.append(f"{name}: no plugin.json at {manifest}")
+                  continue
+              plug = json.loads(manifest.read_text())
+              if plug.get("name") != name:
+                  problems.append(f"{name}: plugin.json names it {plug.get('name')!r}")
+              # A version in both places pins the plugin twice, and the two can drift.
+              if "version" in entry and entry["version"] != plug.get("version"):
+                  problems.append(f"{name}: marketplace version {entry['version']} "
+                                  f"!= plugin.json {plug.get('version')}")
+              print(f"{name:20} {plug.get('version', '?'):8} {src}")
+
+          for p in problems:
+              print(f"ERROR {p}", file=sys.stderr)
+          sys.exit(1 if problems else 0)
+          PY
+      - name: claude plugin validate
+        # Advisory: the CLI is the authority on the schema, but it is a network
+        # install and may need more than a checkout, so it must not gate a merge.
+        continue-on-error: true
+        run: npx -y @anthropic-ai/claude-code@latest plugin validate .
+
+  plugin:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(needs.discover.outputs.plugins) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shell scripts parse under sh and dash
+        run: |
+          for f in $(find "${{ matrix.plugin }}" -name '*.sh'); do
+            sh -n "$f" && dash -n "$f" && echo "ok $f"
+          done
+      - name: claude plugin validate
+        continue-on-error: true
+        run: npx -y @anthropic-ai/claude-code@latest plugin validate ${{ matrix.plugin }}
+      - name: tests
+        run: |
+          shopt -s nullglob
+          found=0
+          for t in ${{ matrix.plugin }}/tests/test_*.py; do
+            found=1
+            echo "== $t"
+            python3 "$t"
+          done
+          # Silence here would mean a plugin quietly shipping untested.
+          [ "$found" = 1 ] || { echo "no tests found for ${{ matrix.plugin }}" >&2; exit 1; }

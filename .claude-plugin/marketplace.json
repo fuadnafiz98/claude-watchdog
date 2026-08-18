@@ -1,6 +1,6 @@
 {
-  "name": "claude-watchdog",
-  "description": "Keeps unattended Claude Code sessions running through transient API errors.",
+  "name": "fuadnafiz98",
+  "description": "Claude Code plugins by fuadnafiz98.",
   "owner": {
     "name": "fuadnafiz98",
     "url": "https://github.com/fuadnafiz98"
@@ -8,7 +8,9 @@
   "plugins": [
     {
       "name": "watchdog",
-      "source": "./",
+      "source": "./watchdog",
+      "category": "reliability",
+      "tags": ["unattended", "api-error", "retry", "resume"],
       "description": "Resumes a turn killed by a transient API error, so unattended runs do not stall until morning."
     }
   ]

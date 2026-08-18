@@ -1,0 +1,75 @@
+name: release
+
+# Publishing a Claude Code plugin is not an upload: users install straight from this
+# repository, so main *is* the registry and a push is the release. What is left for
+# CI is the part humans forget -- marking the version that shipped. Each plugin gets
+# its own tag and GitHub release, `<plugin>-v<version>`, cut when the version in its
+# plugin.json changes and no such tag exists yet.
+#
+# The version is what actually reaches users: Claude Code pins an installed plugin to
+# it and only offers an update when the string changes. So a fix pushed without a
+# version bump stays invisible to anyone who already has the plugin, which is why the
+# summary says loudly when nothing was released.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # tags, and the log used for release notes
+      - name: tag and release every bumped plugin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          released=0
+          for manifest in */.claude-plugin/plugin.json; do
+            dir=${manifest%/.claude-plugin/plugin.json}
+            name=$(jq -r '.name // empty' "$manifest")
+            version=$(jq -r '.version // empty' "$manifest")
+            if [ -z "$name" ] || [ -z "$version" ]; then
+              echo "::error file=$manifest::plugin.json needs both name and version"
+              exit 1
+            fi
+            tag="$name-v$version"
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "$name $version already released as $tag"
+              continue
+            fi
+
+            # Notes come from the commits that touched this plugin since its last
+            # release, so a repository holding several plugins does not credit one
+            # plugin's release with another's work.
+            previous=$(git tag --list "$name-v*" --sort=-v:refname | head -1)
+            range=${previous:+$previous..HEAD}
+            notes=$(git log ${range:-HEAD} --no-merges --pretty='- %s' -- "$dir" | head -50)
+            [ -n "$notes" ] || notes="- no commits touched $dir since ${previous:-the beginning}"
+
+            git tag -a "$tag" -m "$name $version"
+            git push origin "$tag"
+            printf '%s\n' "$notes" | gh release create "$tag" \
+              --title "$name $version" --notes-file - --verify-tag
+            echo "released $tag"
+            {
+              echo "### $name $version"
+              echo
+              printf '%s\n' "$notes"
+            } >> "$GITHUB_STEP_SUMMARY"
+            released=1
+          done
+          if [ "$released" = 0 ]; then
+            {
+              echo "### Nothing released"
+              echo
+              echo "No plugin.json version changed, so users already holding a plugin"
+              echo "will not be offered this push. Bump the version to ship it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
