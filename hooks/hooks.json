@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/afk.py\" hook",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.py\" hook",
             "timeout": 20
           }
         ]

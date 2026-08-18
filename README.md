@@ -1,4 +1,4 @@
-# claude-afk
+# claude-watchdog
 
 Resumes a Claude Code turn that the API killed, so an unattended run keeps going
 instead of sitting at
@@ -14,18 +14,18 @@ One script, one hook, one monitor. **tmux is not required.**
 ## Install
 
 ```
-/plugin marketplace add fuadnafiz98/claude-afk
-/plugin install afk@claude-afk
+/plugin marketplace add fuadnafiz98/claude-watchdog
+/plugin install watchdog@claude-watchdog
 ```
 
 Restart the session (monitors only start at session start), then arm it:
 
 ```
-/afk on
+/watchdog on
 ```
 
 Off by default — auto-continuing is what you want overnight, not while you're watching.
-Check it with `/afk`, which prints which delivery channel is actually live.
+Check it with `/watchdog`, which prints which delivery channel is actually live.
 
 ## Why it isn't just a hook
 
@@ -55,8 +55,8 @@ flowchart TD
 sequenceDiagram
     participant API
     participant CC as Claude Code
-    participant Hook as afk.py hook
-    participant Disk as ~/.claude/afk
+    participant Hook as watchdog.py hook
+    participant Disk as ~/.claude/watchdog
     participant Ch as delivery channel
     participant Claude
 
@@ -108,7 +108,7 @@ flowchart LR
 
 The monitor writes a heartbeat every poll, so the hook can tell whether the in-band
 channel is actually alive rather than assuming it. Force one with
-`afk set channel monitor` (or `tmux`).
+`watchdog set channel monitor` (or `tmux`).
 
 ## What it retries
 
@@ -133,22 +133,59 @@ hour in 60-second steps is pointless. An error type in neither list is reported 
 Backoff `5 → 15 → 30 → 60 → 120s`, with a 60s floor for rate limits and overload,
 capped at 8 retries per session. Counters reset after 12 idle hours.
 
-## Configuration
+## What it costs
 
-Every knob is a config key. Precedence: **`AFK_<KEY>` env var → config file → default.**
+The machinery is free. The retry is not — it costs exactly what typing `continue`
+yourself costs, because it *is* that.
+
+| Part | Model calls | Token cost |
+| --- | --- | --- |
+| `StopFailure` hook | none | **zero** — plain Python, runs and exits |
+| Monitor while idle | none | **zero** — see below |
+| One delivered resume | one new turn | one turn's input + output, same as typing `continue` |
+
+Idle really is zero, by design: the monitor's liveness signal is a **file touch, not a
+stdout line**. Every line a monitor prints becomes a notification in the conversation,
+so a heartbeat printed to stdout would quietly add tokens every few seconds, all night,
+forever. It writes to disk instead and only ever prints when there is a resume to
+deliver.
+
+What is not free is the retry itself. Resuming re-sends the conversation, so a retry on
+a large context is a large input — mostly prompt-cache reads if the retry lands inside
+the cache window, which the 5–120s backoff is chosen to stay inside. The cost that
+actually bites is a **failed** retry: 8 attempts that all die is 8 turns of input for
+no progress. Three things bound it:
+
+- the retry cap (`max_retries`, default 8),
+- the fatal lists, which refuse the errors that would fail identically every time,
+- and `unknown` being the one speculative entry in `retry_types` — it is there so a
+  genuinely transient error nobody has catalogued still recovers. If you would rather
+  not pay for guesses, remove it:
 
 ```sh
-afk config                              # effective values, changed ones marked
-afk set max_retries 20
-afk set backoff 10,30,60                # lists take commas
-afk set retry_types server_error,overloaded,unknown
-afk set channel monitor                 # auto | monitor | tmux
-afk set resume_message "keep going ({attempt}/{max_retries})"
+watchdog set retry_types rate_limit,overloaded,server_error
+watchdog set max_retries 3     # cheaper ceiling on a huge context
+```
+
+Every attempt is logged with its cost driver (attempt number and error), so
+`watchdog log` tells you whether retries are recovering work or burning context.
+
+## Configuration
+
+Every knob is a config key. Precedence: **`WATCHDOG_<KEY>` env var → config file → default.**
+
+```sh
+watchdog config                              # effective values, changed ones marked
+watchdog set max_retries 20
+watchdog set backoff 10,30,60                # lists take commas
+watchdog set retry_types server_error,overloaded,unknown
+watchdog set channel monitor                 # auto | monitor | tmux
+watchdog set resume_message "keep going ({attempt}/{max_retries})"
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `false` | armed or not (`afk on` / `afk off`) |
+| `enabled` | `false` | armed or not (`watchdog on` / `watchdog off`) |
 | `max_retries` | `8` | retries per session before giving up |
 | `backoff` | `[5,15,30,60,120]` | seconds per attempt; last value repeats |
 | `slow_floor` | `60` | minimum wait for `slow_types` |
@@ -160,9 +197,9 @@ afk set resume_message "keep going ({attempt}/{max_retries})"
 | `poll_seconds` | `2` | monitor poll interval |
 | `heartbeat_stale` | `30` | seconds before the monitor counts as down |
 | `counter_ttl_hours` | `12` | idle time before the retry counter resets |
-| `resume_message` | see `afk config` | template: `{attempt} {max_retries} {error} {message}` |
+| `resume_message` | see `watchdog config` | template: `{attempt} {max_retries} {error} {message}` |
 
-Config and state live in `~/.claude/afk/` (override with `AFK_HOME`), so updating or
+Config and state live in `~/.claude/watchdog/` (override with `WATCHDOG_HOME`), so updating or
 reinstalling the plugin keeps your settings, counters, and log.
 
 Plugin `userConfig` is deliberately not used: those values reach hooks but **not**
@@ -171,32 +208,32 @@ monitors, which would leave the two halves disagreeing about the same setting.
 ## Commands
 
 ```
-/afk                 # doctor: which channel is live, per session
-/afk on | off
+/watchdog                 # doctor: which channel is live, per session
+/watchdog on | off
 ```
 
-`afk` is also on the Bash tool's PATH while the plugin is enabled, and works from your
+`watchdog` is also on the Bash tool's PATH while the plugin is enabled, and works from your
 own shell:
 
 ```sh
-afk doctor           # armed? monitor up? tmux reachable? anything queued?
-afk log 20
-afk reset            # clear counters, queued resumes, heartbeats
-afk test             # 53 checks
+watchdog doctor           # armed? monitor up? tmux reachable? anything queued?
+watchdog log 20
+watchdog reset            # clear counters, queued resumes, heartbeats
+watchdog test             # 53 checks
 ```
 
-Start with `afk doctor`. If a session shows `would use: none - cannot resume`, restart
+Start with `watchdog doctor`. If a session shows `would use: none - cannot resume`, restart
 it so the monitor comes up.
 
 ## Files
 
 ```
-scripts/afk.py       everything: hook, monitor, tmux sender, doctor, config
-bin/afk              two-line shim onto that script
-hooks/hooks.json     StopFailure → afk.py hook
-monitors/monitors.json  afk-resume → afk.py monitor
-commands/afk.md      /afk
-tests/test_afk.py    53 checks
+scripts/watchdog.py       everything: hook, monitor, tmux sender, doctor, config
+bin/watchdog              two-line shim onto that script
+hooks/hooks.json     StopFailure → watchdog.py hook
+monitors/monitors.json  watchdog-resume → watchdog.py monitor
+commands/watchdog.md      /watchdog
+tests/test_watchdog.py    53 checks
 ```
 
 ## Verified vs not

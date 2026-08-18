@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""AFK: resume a Claude Code turn that an API error killed.
+"""Watchdog: resume a Claude Code turn that an API error killed.
 
 An API error ends a turn without firing Stop, so no hook can refuse the stop.
 Only StopFailure fires, and its output is discarded -- so the resume has to be
 delivered from outside the turn. This one file is the whole plugin:
 
-    afk.py hook        StopFailure hook: classify, back off, queue a resume
-    afk.py monitor     delivery via monitor stdout (in band, no tmux needed)
-    afk.py deliver ID  delivery by typing into a tmux pane (fallback)
-    afk.py doctor      which channel would fire right now
-    afk.py on|off|status|log|reset|config|set
+    watchdog.py hook        StopFailure hook: classify, back off, queue a resume
+    watchdog.py monitor     delivery via monitor stdout (in band, no tmux needed)
+    watchdog.py deliver ID  delivery by typing into a tmux pane (fallback)
+    watchdog.py doctor      which channel would fire right now
+    watchdog.py on|off|status|log|reset|config|set
 """
 
 import json
@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-HOME = Path(os.environ.get("AFK_HOME") or Path.home() / ".claude" / "afk")
+HOME = Path(os.environ.get("WATCHDOG_HOME") or Path.home() / ".claude" / "watchdog")
 CONFIG_FILE = HOME / "config.json"
 
 DEFAULTS = {
@@ -53,7 +53,7 @@ DEFAULTS = {
     ),
 }
 
-# Every key is settable as AFK_<KEY>; lists take commas, JSON is tried first.
+# Every key is settable as WATCHDOG_<KEY>; lists take commas, JSON is tried first.
 def _coerce(default, raw):
     try:
         val = json.loads(raw)
@@ -78,7 +78,7 @@ def config():
     except (OSError, json.JSONDecodeError):
         pass
     for key, default in DEFAULTS.items():
-        raw = os.environ.get(f"AFK_{key.upper()}")
+        raw = os.environ.get(f"WATCHDOG_{key.upper()}")
         if raw is not None:
             cfg[key] = _coerce(default, raw)
     return cfg
@@ -206,7 +206,7 @@ def cmd_hook():
     message = payload.get("last_assistant_message") or ""
 
     if not cfg["enabled"]:
-        log(f"session={sid} error={error} (afk off)")
+        log(f"session={sid} error={error} (watchdog off)")
         return
 
     verdict, detail = classify(error, message, cfg)
@@ -214,14 +214,14 @@ def cmd_hook():
         _path(sid, "attempts").unlink(missing_ok=True)
         log(f"session={sid} not resuming: {detail}")
         tail = "" if verdict == "fatal" else " Report it if it was in fact transient."
-        print(json.dumps({"systemMessage": f"afk: not resuming, {detail}.{tail}"}))
+        print(json.dumps({"systemMessage": f"watchdog: not resuming, {detail}.{tail}"}))
         return
 
     n = attempts(sid, cfg) + 1
     if n > cfg["max_retries"]:
         _path(sid, "attempts").unlink(missing_ok=True)
         log(f"session={sid} gave up after {cfg['max_retries']} attempts")
-        print(json.dumps({"systemMessage": f"afk: gave up after {cfg['max_retries']} retries."}))
+        print(json.dumps({"systemMessage": f"watchdog: gave up after {cfg['max_retries']} retries."}))
         return
 
     _path(sid, "attempts").write_text(str(n))
@@ -238,7 +238,7 @@ def cmd_hook():
     log(f"session={sid} retry={n}/{cfg['max_retries']} in {delay}s via {channel} ({detail})")
     if channel == "tmux":
         spawn_deliver(sid, delay)
-    print(json.dumps({"systemMessage": f"afk: retry {n}/{cfg['max_retries']} in {delay}s via {channel}."}))
+    print(json.dumps({"systemMessage": f"watchdog: retry {n}/{cfg['max_retries']} in {delay}s via {channel}."}))
 
 
 # ------------------------------------------------------------- monitor --------
@@ -249,7 +249,7 @@ def cmd_monitor():
     while True:
         now = time.time()
         if not sid and now >= next_try:
-            sid = os.environ.get("AFK_SESSION_ID") or resolve_session()
+            sid = os.environ.get("WATCHDOG_SESSION_ID") or resolve_session()
             next_try = now + 30
             if sid:
                 log(f"monitor bound to session={sid}")
@@ -351,7 +351,7 @@ def cmd_deliver(session_id, delay):
     log(f"session={session_id} NO channel (no monitor, no tmux pane) -- notified only")
     subprocess.run(["osascript", "-e",
                     'display notification "A turn stalled on an API error and needs a manual continue." '
-                    'with title "Claude Code AFK"'], check=False,
+                    'with title "Claude Code Watchdog"'], check=False,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -364,7 +364,7 @@ def cmd_doctor():
         tmux_up = subprocess.run(["tmux", "info"], capture_output=True, timeout=5).returncode == 0
     except Exception:
         pass
-    print(f"enabled:     {'yes' if cfg['enabled'] else 'no   (run: afk on)'}")
+    print(f"enabled:     {'yes' if cfg['enabled'] else 'no   (run: watchdog on)'}")
     print(f"state:       {HOME}")
     print(f"max retries: {cfg['max_retries']}   backoff: {cfg['backoff']}   channel: {cfg['channel']}")
     print(f"tmux:        {'running' if tmux_up else 'not running'}")
@@ -397,13 +397,13 @@ def main(argv):
         cmd_doctor()
     elif cmd == "on":
         save_config({"enabled": True})
-        print(f"AFK on. Turns killed by a transient API error retry themselves "
+        print(f"Watchdog on. Turns killed by a transient API error retry themselves "
               f"(max {cfg['max_retries']}).")
     elif cmd == "off":
         save_config({"enabled": False})
-        print("AFK off.")
+        print("Watchdog off.")
     elif cmd == "status":
-        print("AFK on" if cfg["enabled"] else "AFK off")
+        print("Watchdog on" if cfg["enabled"] else "Watchdog off")
     elif cmd == "log":
         n = int(argv[1]) if len(argv) > 1 else 20
         try:
@@ -419,16 +419,16 @@ def main(argv):
         for key in DEFAULTS:
             mark = "" if cfg[key] == DEFAULTS[key] else "  <- changed"
             print(f"{key:18} {json.dumps(cfg[key])}{mark}")
-        print(f"\nfile: {CONFIG_FILE}   override any key with AFK_<KEY>")
+        print(f"\nfile: {CONFIG_FILE}   override any key with WATCHDOG_<KEY>")
     elif cmd == "set" and len(argv) >= 3:
         key = argv[1]
         if key not in DEFAULTS:
-            print(f"unknown key {key!r}. See: afk config", file=sys.stderr)
+            print(f"unknown key {key!r}. See: watchdog config", file=sys.stderr)
             return 1
         save_config({key: _coerce(DEFAULTS[key], argv[2])})
         print(f"{key} = {json.dumps(config()[key])}")
     else:
-        print("usage: afk {on|off|status|doctor|log [n]|reset|config|set KEY VALUE}",
+        print("usage: watchdog {on|off|status|doctor|log [n]|reset|config|set KEY VALUE}",
               file=sys.stderr)
         return 1
     return 0

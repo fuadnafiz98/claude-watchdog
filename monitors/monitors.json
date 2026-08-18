@@ -1,7 +1,7 @@
 [
   {
-    "name": "afk-resume",
-    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/afk.py\" monitor",
+    "name": "watchdog-resume",
+    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.py\" monitor",
     "description": "Turns killed by a transient API error"
   }
 ]

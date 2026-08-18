@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for AFK. The hook runs as a real subprocess against a throwaway state dir."""
+"""Tests for Watchdog. The hook runs as a real subprocess against a throwaway state dir."""
 
 import importlib
 import json
@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-AFK = Path(__file__).resolve().parent.parent / "scripts" / "afk.py"
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "watchdog.py"
 failures = []
 
 
@@ -25,10 +25,10 @@ def home():
 
 
 def run(args, h, stdin="", **env):
-    e = dict(os.environ, AFK_HOME=str(h), AFK_ENABLED="1", AFK_CHANNEL="monitor")
-    e.pop("AFK_MAX_RETRIES", None)
+    e = dict(os.environ, WATCHDOG_HOME=str(h), WATCHDOG_ENABLED="1", WATCHDOG_CHANNEL="monitor")
+    e.pop("WATCHDOG_MAX_RETRIES", None)
     e.update({k: str(v) for k, v in env.items()})
-    p = subprocess.run([sys.executable, str(AFK)] + args, input=stdin,
+    p = subprocess.run([sys.executable, str(SCRIPT)] + args, input=stdin,
                        capture_output=True, text=True, env=e, timeout=30)
     return p
 
@@ -68,7 +68,7 @@ check("hook reports the retry", "retry 1/8" in msg(out), out)
 
 # --- off means off ----------------------------------------------------------
 h = home()
-out, _ = hook(h, AFK_ENABLED="0")
+out, _ = hook(h, WATCHDOG_ENABLED="0")
 check("disabled queues nothing", queued(h) is None, out)
 
 # --- fatal error types ------------------------------------------------------
@@ -119,29 +119,29 @@ hook(h, sid="alpha"); hook(h, sid="alpha"); hook(h, sid="beta")
 check("per-session counters", queued(h, "beta")["attempt"] == 1, queued(h, "beta"))
 check("other session keeps its count", queued(h, "alpha")["attempt"] == 2, queued(h, "alpha"))
 
-# --- configuration: env, file, and afk set --------------------------------
+# --- configuration: env, file, and watchdog set --------------------------------
 h = home()
-outs = [hook(h, AFK_MAX_RETRIES=2)[0] for _ in range(3)]
-check("AFK_MAX_RETRIES honoured", "gave up after 2" in msg(outs[2]), outs[2])
+outs = [hook(h, WATCHDOG_MAX_RETRIES=2)[0] for _ in range(3)]
+check("WATCHDOG_MAX_RETRIES honoured", "gave up after 2" in msg(outs[2]), outs[2])
 
 h = home()
 Path(h, "config.json").write_text(json.dumps({"max_retries": 1, "backoff": [7]}))
-e = dict(os.environ, AFK_HOME=h, AFK_ENABLED="1", AFK_CHANNEL="monitor")
-e.pop("AFK_MAX_RETRIES", None)
-p1 = subprocess.run([sys.executable, str(AFK), "hook"], input=json.dumps(
+e = dict(os.environ, WATCHDOG_HOME=h, WATCHDOG_ENABLED="1", WATCHDOG_CHANNEL="monitor")
+e.pop("WATCHDOG_MAX_RETRIES", None)
+p1 = subprocess.run([sys.executable, str(SCRIPT), "hook"], input=json.dumps(
     {"session_id": "cfg", "error": "server_error", "last_assistant_message": "x"}),
     capture_output=True, text=True, env=e, timeout=30)
 check("config file sets backoff", queued(h, "cfg")["delay"] == 7, queued(h, "cfg"))
-p2 = subprocess.run([sys.executable, str(AFK), "hook"], input=json.dumps(
+p2 = subprocess.run([sys.executable, str(SCRIPT), "hook"], input=json.dumps(
     {"session_id": "cfg", "error": "server_error", "last_assistant_message": "x"}),
     capture_output=True, text=True, env=e, timeout=30)
 check("config file sets max_retries", "gave up after 1" in p2.stdout, p2.stdout)
 
 h = home()
 r = run(["set", "max_retries", "3"], h)
-check("afk set writes the file", '"max_retries": 3' in Path(h, "config.json").read_text(), r.stdout)
+check("watchdog set writes the file", '"max_retries": 3' in Path(h, "config.json").read_text(), r.stdout)
 r = run(["set", "retry_types", "server_error,teapot_error"], h)
-check("afk set parses a list", json.loads(Path(h, "config.json").read_text())["retry_types"]
+check("watchdog set parses a list", json.loads(Path(h, "config.json").read_text())["retry_types"]
       == ["server_error", "teapot_error"], r.stdout)
 out, _ = hook(h, error="teapot_error", message="now allowed")
 check("widened retry_types takes effect", queued(h) is not None, out)
@@ -149,26 +149,26 @@ r = run(["set", "nonsense", "1"], h)
 check("unknown config key refused", r.returncode == 1 and "unknown key" in r.stderr, r.stderr)
 
 h = home()
-r = run(["config"], h, AFK_MAX_RETRIES=99)
+r = run(["config"], h, WATCHDOG_MAX_RETRIES=99)
 check("config shows effective value", "99" in r.stdout and "<- changed" in r.stdout, r.stdout)
 
 # --- on/off/status round trip --------------------------------------------
 h = home()
-e = dict(os.environ, AFK_HOME=h); e.pop("AFK_ENABLED", None)
+e = dict(os.environ, WATCHDOG_HOME=h); e.pop("WATCHDOG_ENABLED", None)
 def ctl(*a):
-    return subprocess.run([sys.executable, str(AFK)] + list(a), capture_output=True,
+    return subprocess.run([sys.executable, str(SCRIPT)] + list(a), capture_output=True,
                           text=True, env=e, timeout=30).stdout.strip()
-check("default is off", ctl("status") == "AFK off", ctl("status"))
+check("default is off", ctl("status") == "Watchdog off", ctl("status"))
 ctl("on")
-check("on persists", ctl("status") == "AFK on", ctl("status"))
+check("on persists", ctl("status") == "Watchdog on", ctl("status"))
 ctl("off")
-check("off persists", ctl("status") == "AFK off", ctl("status"))
+check("off persists", ctl("status") == "Watchdog off", ctl("status"))
 
 # --- direct-import helpers ----------------------------------------------
 h = home()
-os.environ["AFK_HOME"] = h
-sys.path.insert(0, str(AFK.parent))
-import afk as mod  # noqa: E402
+os.environ["WATCHDOG_HOME"] = h
+sys.path.insert(0, str(SCRIPT.parent))
+import watchdog as mod  # noqa: E402
 importlib.reload(mod)
 cfg = mod.config()
 
