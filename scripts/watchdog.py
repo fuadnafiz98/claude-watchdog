@@ -239,7 +239,12 @@ def cmd_hook():
     message = payload.get("last_assistant_message") or ""
 
     if not cfg["enabled"]:
-        log(f"session={sid} error={error} (watchdog off)")
+        # The one moment the user provably cares, so it is worth one line: the turn
+        # just died and the thing that would have resumed it is installed but idle.
+        log(f"session={sid} error={error} (not armed)")
+        print(json.dumps({"systemMessage":
+                          "watchdog: installed but not armed, so this turn was not resumed. "
+                          "Run /watchdog on (or `watchdog on`) to arm it."}))
         return
 
     verdict, detail = classify(error, message, cfg)
@@ -369,7 +374,10 @@ def _which(name):
 
 def cmd_doctor():
     cfg = config()
-    print(f"enabled:     {'yes' if cfg['enabled'] else 'no   (run: watchdog on)'}")
+    armed = cfg["enabled"]
+    print(f"armed:       {'yes' if armed else 'NO -- nothing will be resumed'}")
+    if not armed:
+        print("             arm it with:  /watchdog on      (or: watchdog on)")
     print(f"state:       {HOME}")
     print(f"max retries: {cfg['max_retries']}   backoff: {cfg['backoff']}   channel: {cfg['channel']}")
 
@@ -402,8 +410,10 @@ def cmd_doctor():
     if pending:
         print(f"\npending resumes: {', '.join(p.stem[:8] for p in pending)}")
     if not live:
-        print("\nNo monitor is listening. Restart the session after installing:")
-        print("monitors start at session start, and only in an interactive session.")
+        print("\nNo monitor is listening: monitors start at session start, and only in an")
+        print("interactive session, so restart this session to pick one up.")
+        if not armed:
+            print("Arm it first with /watchdog on, or nothing will be resumed even then.")
 
 
 # ----------------------------------------------------------------- control ----

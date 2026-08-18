@@ -1,7 +1,7 @@
 {
   "name": "watchdog",
   "displayName": "Watchdog",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Resumes a Claude Code turn that was killed by a transient API error, so unattended runs survive the night instead of waiting for someone to type \"continue\".",
   "author": {
     "name": "fuadnafiz98",

@@ -29,8 +29,22 @@ Restart the session (monitors start at session start), then arm it:
 /watchdog on
 ```
 
-Off by default — auto-continuing is what you want overnight, not while you're watching.
-Run `/watchdog` to see whether the in-band channel is actually live.
+**It does nothing until you arm it.** Off by default, because auto-continuing is what you
+want overnight, not while you're watching. `/watchdog` reports whether it is armed and
+whether the in-band channel is live:
+
+```
+armed:       NO -- nothing will be resumed
+             arm it with:  /watchdog on      (or: watchdog on)
+```
+
+If a turn dies while it is installed but not armed, it says so on the spot rather than
+staying quiet:
+
+```
+watchdog: installed but not armed, so this turn was not resumed.
+Run /watchdog on (or `watchdog on`) to arm it.
+```
 
 ## When it actually fires
 
@@ -280,7 +294,7 @@ watchdog doctor
 watchdog log 20
 watchdog reset           # clear counters and pending resumes
 watchdog reap            # kill orphaned monitors from a killed session
-watchdog test            # 70 checks
+watchdog test            # 72 checks
 ```
 
 ## Files
@@ -291,7 +305,7 @@ scripts/watchdog.py     hook, delivery, doctor, config — only runs on demand
 hooks/hooks.json        StopFailure → watchdog.py hook
 monitors/monitors.json  watchdog-resume → monitor.sh
 commands/watchdog.md    /watchdog
-tests/test_watchdog.py  70 checks
+tests/test_watchdog.py  72 checks
 ```
 
 ## Verified vs not
@@ -337,7 +351,7 @@ Also verified:
 - Footprint numbers in the table above.
 - The resident monitor: fifo naming, relaying, liveness ticks never reaching stdout,
   exiting when its owner dies, and dying on `SIGTERM`.
-- 70 checks in `tests/test_watchdog.py`; 22 deliberate mutations (16 in the Python, 6 in
+- 72 checks in `tests/test_watchdog.py`; 23 deliberate mutations (17 in the Python, 6 in
   the shell) are each caught by them.
 
 Not verified: Linux at runtime — the shell is checked under `dash` and every tool used is

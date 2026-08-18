@@ -74,6 +74,8 @@ check("hook returns immediately", p.returncode == 0 and not p.stderr.strip(), p.
 h = home()
 out, _ = hook(h, WATCHDOG_ENABLED="0")
 check("disabled records nothing", incident(h) is None, out)
+check("disabled says why the turn was not resumed", "not armed" in msg(out), msg(out))
+check("disabled names the command to arm it", "/watchdog on" in msg(out), msg(out))
 
 # --- fatal error types ------------------------------------------------------
 for etype in ["model_not_found", "authentication_failed", "billing_error",
