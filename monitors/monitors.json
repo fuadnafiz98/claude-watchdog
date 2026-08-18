@@ -1,7 +1,7 @@
 [
   {
     "name": "afk-resume",
-    "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/monitor.sh\"",
+    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/afk.py\" monitor",
     "description": "Turns killed by a transient API error"
   }
 ]
