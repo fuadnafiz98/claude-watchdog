@@ -25,6 +25,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0        # tags, and the log used for release notes
+      - name: identity for the tags this job creates
+        # An annotated tag is a commit-like object and needs an author, which a bare
+        # runner does not have.
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
       - name: tag and release every bumped plugin
         env:
           GH_TOKEN: ${{ github.token }}
