@@ -203,25 +203,30 @@ flowchart TD
     T -->|"'usage limit reached'<br/>'credit balance'<br/>'prompt is too long'"| F[never retry]
     T -->|no| Y{error in<br/>fatal_types?}
     Y -->|"auth · billing · model_not_found<br/>invalid_request · max_output_tokens"| F
-    Y -->|no| C{error in<br/>claude_retry_types?}
-    C -->|"rate_limit · overloaded<br/>server_error"| L[leave it to Claude Code]
-    C -->|no| R{error in<br/>retry_types?}
-    R -->|"unknown"| G[schedule a resume]
+    Y -->|no| R{error in<br/>retry_types?}
+    R -->|"rate_limit · overloaded<br/>server_error · unknown"| G[schedule a resume]
     R -->|anything else| S[report it, don't retry]
 ```
 
 Text before type, because a spent quota arrives as `rate_limit` — retrying that hourly in
 60-second steps is pointless. An error type in no list is reported and **not** retried.
 
-`claude_retry_types` is the list Claude Code already owns: it retries those ~10 times on
-its own backoff and the turn only dies once that loop is spent, so a resume on top of it
-waits out a delay the session has already served. What is left for the watchdog is
-`unknown` — a transient failure nobody has catalogued, which is the case where the turn
-really does sit there. Putting a type back into `retry_types` re-enables resuming it;
-`retry_types` is checked first, so you do not have to edit both lists.
+**Every transient type is retried, including the ones Claude Code retries itself.**
+0.3.0 carved out `rate_limit`, `overloaded` and `server_error` on the theory that the CLI
+still had them in hand and a resume would stack a second backoff on top of its own. That
+was wrong, and it broke the case this plugin exists for: `StopFailure` fires *only after*
+the CLI's retry loop is spent, so by the time the hook runs nobody is retrying anything —
+the turn is already dead. The symptom in the log was
 
-Backoff `5 → 15 → 30 → 60 → 120s`, 8 retries per session, counter resets after 12 idle
-hours.
+```
+not resuming: Claude Code retries server_error itself
+```
+
+against `API Error: The response stopped arriving`, which arrives as `server_error`. Fixed
+in 0.5.0; there is a test for that exact payload.
+
+Backoff `5 → 15 → 30 → 60 → 120s`, 60s floor for rate limits and overload, 8 retries per
+session, counter resets after 12 idle hours.
 
 ## Requirements
 
@@ -284,19 +289,13 @@ changing language, so the language stays boring on purpose.
 | One delivered resume | one new turn | same as typing `continue` yourself |
 
 The expense is a *failed* retry: 8 attempts that all die is 8 turns of input for no
-progress. The cap, the backoff and the fatal lists exist to bound that. `unknown` is
-speculative by nature — it's the whole of `retry_types` so an uncatalogued transient error
-still recovers. To bound it harder:
+progress. The cap, the backoff and the fatal lists exist to bound that. `unknown` is the
+one speculative entry in `retry_types` — it's there so an uncatalogued transient error
+still recovers. To stop paying for guesses:
 
 ```sh
+watchdog set retry_types rate_limit,overloaded,server_error
 watchdog set max_retries 3
-```
-
-Or the other direction, if you want the watchdog to have another go at what Claude Code
-gave up on:
-
-```sh
-watchdog set retry_types unknown,overloaded,server_error
 ```
 
 ## Configuration
@@ -316,8 +315,9 @@ watchdog set resume_message "keep going ({attempt}/{max_retries})"
 | `enabled` | `false` | armed or not (`watchdog on` / `off`) |
 | `max_retries` | `8` | retries per session before giving up |
 | `backoff` | `[5,15,30,60,120]` | seconds per attempt; last value repeats |
-| `retry_types` | `unknown` | retried (checked before `claude_retry_types`) |
-| `claude_retry_types` | `rate_limit, overloaded, server_error` | Claude Code retries these itself; left alone |
+| `slow_floor` | `60` | minimum wait for `slow_types` |
+| `slow_types` | `rate_limit, overloaded` | error types that get the floor |
+| `retry_types` | `rate_limit, overloaded, server_error, unknown` | retried |
 | `fatal_types` | auth, oauth, billing, invalid_request, model_not_found, max_output_tokens | never retried |
 | `fatal_text` | usage limit reached, credit balance, … | message substrings that veto a retry |
 | `channel` | `auto` | `auto`, `monitor`, or `tmux` |
@@ -391,8 +391,7 @@ gave up after 2 attempts
 That covers the whole chain on the default channel with no tmux delivery involved: real
 `StopFailure`, real classification (`server_error`), scheduling, fifo hand-off, the monitor
 relaying it, Claude resuming, the cap stopping the loop, and the state files cleaned up
-afterwards. That run predates `claude_retry_types`, so `server_error` was still resumed
-here; today the same chain runs for `unknown` and this log is left as it was recorded.
+afterwards.
 
 Also verified:
 
