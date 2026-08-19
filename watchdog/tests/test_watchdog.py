@@ -143,6 +143,89 @@ hook(h, sid="alpha"); hook(h, sid="beta")
 check("per-session counters", incident(h, "beta")["attempt"] == 1, incident(h, "beta"))
 check("other session keeps its count", incident(h, "alpha")["attempt"] == 2, incident(h, "alpha"))
 
+# --- the stall cap ---------------------------------------------------------
+# Verified against a local endpoint that accepts the request and then sends nothing:
+# with the var at 20000 the CLI reissued the request every 20.0s, and with 15000
+# delivered through settings.json every 15.1s. These checks are about the writer.
+def settings(cfg):
+    p = Path(cfg) / "settings.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def stall(cfg, *args, h=None):
+    p = run(["stall", *args], h or home(), CLAUDE_CONFIG_DIR=str(cfg))
+    return p.stdout + p.stderr, p.returncode
+
+
+cfg = home()
+out, rc = stall(cfg)
+check("unset stall reports the cost of leaving it unset",
+      rc == 0 and "180s" in out and "watchdog stall 60" in out, out)
+
+out, rc = stall(cfg, "60")
+check("stall writes the var in milliseconds",
+      rc == 0 and ((settings(cfg) or {}).get("env") or {}).get(
+          "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS") == "60000", settings(cfg))
+out, _ = stall(cfg)
+check("stall reports what it stored", "60s" in out, out)
+
+# The file belongs to the user, and a plugin that eats unrelated settings is worse
+# than one that does nothing.
+Path(cfg, "settings.json").write_text(json.dumps(
+    {"model": "opus", "env": {"FOO": "1"}, "permissions": {"defaultMode": "auto"}}))
+out, rc = stall(cfg, "90")
+after = settings(cfg) or {}
+env_after = after.get("env") or {}
+check("other settings survive a write",
+      after.get("model") == "opus"
+      and (after.get("permissions") or {}).get("defaultMode") == "auto"
+      and env_after.get("FOO") == "1"
+      and env_after.get("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS") == "90000", after)
+try:
+    backup = json.loads(Path(cfg, "settings.json.watchdog.bak").read_text())
+except OSError:
+    backup = None
+check("a backup of the previous file is kept",
+      (backup or {}).get("env") == {"FOO": "1"}, backup)
+
+out, rc = stall(cfg, "off")
+after = settings(cfg) or {}
+env_after = after.get("env") or {}
+check("off removes only our variable",
+      rc == 0 and "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS" not in env_after
+      and env_after.get("FOO") == "1" and after.get("model") == "opus", after)
+
+cfg2 = home()
+stall(cfg2, "60")
+stall(cfg2, "off")
+check("off leaves no empty env behind", "env" not in settings(cfg2), settings(cfg2))
+
+cfg3 = home()
+out, rc = stall(cfg3, "5")
+check("a value the CLI would clamp is refused",
+      rc == 1 and settings(cfg3) is None and "10-1800" in out, out)
+out, rc = stall(cfg3, "later")
+check("a non-numeric argument is refused", rc == 1 and "usage" in out, out)
+
+out, rc = stall(cfg3, "20")
+check("an aggressive cap warns about time to first byte",
+      rc == 0 and "first byte" in out, out)
+
+cfg4 = home()
+Path(cfg4, "settings.json").write_text("{ this is not json")
+out, rc = stall(cfg4, "60")
+check("unparseable settings are refused, not overwritten",
+      rc == 1 and Path(cfg4, "settings.json").read_text() == "{ this is not json"
+      and "not valid JSON" in out, out)
+
+cfg5 = home()
+stall(cfg5, "60")
+p = run(["doctor"], home(), CLAUDE_CONFIG_DIR=str(cfg5))
+check("doctor reports the cap", "stall cap:   60s" in p.stdout, p.stdout)
+p = run(["doctor"], home(), CLAUDE_CONFIG_DIR=str(home()))
+check("doctor reports its absence, with the fix", "stall cap:   none" in p.stdout
+      and "watchdog stall 60" in p.stdout, p.stdout)
+
 # --- configuration ---------------------------------------------------------
 check("bool from env", w._coerce(False, "1") is True and w._coerce(True, "off") is False)
 check("int list from a single value", w._coerce(w.DEFAULTS["backoff"], "1") == [1],

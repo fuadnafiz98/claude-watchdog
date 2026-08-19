@@ -8,6 +8,7 @@ sh blocked in open(2) on a fifo -- see that file.
     watchdog.py hook            StopFailure hook: classify, then schedule a resume
     watchdog.py deliver SID     write the resume into the session (fifo, else tmux)
     watchdog.py doctor          platform preflight and per-session channel
+    watchdog.py stall [SECS]    cap how long a silent stream is waited out
     watchdog.py on|off|status|log|reset|config|set
 """
 
@@ -21,6 +22,28 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("WATCHDOG_HOME") or Path.home() / ".claude" / "watchdog")
 CONFIG_FILE = HOME / "config.json"
+
+# --- the stall cap -------------------------------------------------------------
+# A different failure from the one the rest of this file handles: the request is
+# accepted and then nothing arrives. Claude Code shows "Waiting for API response .
+# will retry in 2m 0s" and sits there, because its byte-level stream watchdog only
+# gives up after 180s -- then it retries by itself and usually succeeds at once. So
+# the wait is the whole cost, and it is one env var, read straight from the process
+# environment by the CLI:
+#
+#   bm = min(clamp(CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS, 10s, 30min), stream timeout)
+#
+# Verified against a local endpoint that accepts the request and sends no bytes: at
+# 20000 the CLI reissued the request every 20.0s, saying "stream idle: no bytes for
+# 20000ms". CLAUDE_STREAM_IDLE_TIMEOUT_MS cannot do this -- it is floored at 300s.
+#
+# It has to be delivered through settings.json, since a hook cannot change the
+# environment of the session that spawned it.
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+SETTINGS_FILE = CLAUDE_DIR / "settings.json"
+STALL_VAR = "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"
+STALL_MIN, STALL_MAX = 10, 1800          # the CLI's own clamp
+STALL_CLI_DEFAULT = 180                  # what it waits with the var unset
 
 DEFAULTS = {
     "enabled": False,
@@ -367,6 +390,109 @@ def cmd_deliver(session_id):
     notify("A turn stalled on an API error and needs a manual continue.")
 
 
+# ------------------------------------------------------------------- stall ----
+def stall_setting():
+    """(seconds_or_None, note) for the value settings.json will hand a new session."""
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text())
+    except FileNotFoundError:
+        return None, "no settings.json yet"
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"settings.json unreadable ({exc.__class__.__name__})"
+    val = (raw.get("env") or {}).get(STALL_VAR)
+    if val is None:
+        return None, "not set"
+    try:
+        return int(str(val)) // 1000, ""
+    except ValueError:
+        return None, f"set to something non-numeric ({val!r})"
+
+
+def stall_write(seconds):
+    """Set or clear the var in settings.json, leaving every other key alone."""
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    raw = {}
+    if SETTINGS_FILE.exists():
+        try:
+            raw = json.loads(SETTINGS_FILE.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            # Overwriting a file we could not parse would throw away real settings.
+            return f"settings.json is not valid JSON ({exc}); fix it first"
+        # One rolling backup, because this is the user's file and not ours.
+        try:
+            (SETTINGS_FILE.parent / (SETTINGS_FILE.name + ".watchdog.bak")).write_text(
+                json.dumps(raw, indent=2) + "\n")
+        except OSError:
+            pass
+    env = dict(raw.get("env") or {})
+    if seconds is None:
+        env.pop(STALL_VAR, None)
+    else:
+        env[STALL_VAR] = str(seconds * 1000)
+    if env:
+        raw["env"] = env
+    else:
+        raw.pop("env", None)
+    tmp = SETTINGS_FILE.with_suffix(".json.watchdog-tmp")
+    try:
+        tmp.write_text(json.dumps(raw, indent=2) + "\n")
+        os.replace(tmp, SETTINGS_FILE)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        return f"could not write {SETTINGS_FILE}: {exc}"
+    return None
+
+
+def cmd_stall(arg):
+    live = os.environ.get(STALL_VAR)
+    stored, note = stall_setting()
+
+    if arg is None:
+        if stored is not None:
+            print(f"Stalled streams are given up on after {stored}s, then retried "
+                  f"(set in {SETTINGS_FILE}).")
+        else:
+            print(f"Not capped ({note}): Claude Code waits out a silent stream for "
+                  f"{STALL_CLI_DEFAULT}s before retrying it.")
+            print("Cap it with:  watchdog stall 60")
+        if live and (stored is None or live != str(stored * 1000)):
+            print(f"This session was started with {STALL_VAR}={live}, which is what "
+                  f"it is actually using.")
+        return 0
+
+    if arg in ("off", "none", "0"):
+        err = stall_write(None)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        print(f"Cap removed. New sessions wait the full {STALL_CLI_DEFAULT}s again.")
+        return 0
+
+    try:
+        seconds = int(arg)
+    except ValueError:
+        print(f"usage: watchdog stall [SECONDS|off]   (got {arg!r})", file=sys.stderr)
+        return 1
+    if not STALL_MIN <= seconds <= STALL_MAX:
+        print(f"Claude Code clamps this to {STALL_MIN}-{STALL_MAX}s, so {seconds}s "
+              f"would not be honoured.", file=sys.stderr)
+        return 1
+
+    err = stall_write(seconds)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    print(f"Stalled streams will be abandoned and retried after {seconds}s "
+          f"(was {stored if stored is not None else STALL_CLI_DEFAULT}s).")
+    if seconds < 45:
+        # The same clock covers time-to-first-byte, so an aggressive cap can cut off
+        # a request that is merely slow to start rather than dead.
+        print(f"{seconds}s is aggressive: this clock also covers the wait for the "
+              f"first byte, which a large-context turn can legitimately exceed.")
+    print("Takes effect in sessions started from now on.")
+    return 0
+
+
 # ------------------------------------------------------------------ doctor ----
 def _which(name):
     for d in os.environ.get("PATH", "").split(os.pathsep):
@@ -384,6 +510,13 @@ def cmd_doctor():
         print("             arm it with:  /watchdog on      (or: watchdog on)")
     print(f"state:       {HOME}")
     print(f"max retries: {cfg['max_retries']}   backoff: {cfg['backoff']}   channel: {cfg['channel']}")
+    stalled, _ = stall_setting()
+    if stalled is None:
+        print(f"stall cap:   none -- a silent stream is waited out for "
+              f"{STALL_CLI_DEFAULT}s before Claude Code retries it")
+        print("             cap it with:  watchdog stall 60")
+    else:
+        print(f"stall cap:   {stalled}s, then Claude Code retries by itself")
 
     print("\nrequirements")
     for label, ok, note in [
@@ -430,6 +563,8 @@ def main(argv):
         cmd_deliver(argv[1])
     elif cmd == "doctor":
         cmd_doctor()
+    elif cmd == "stall":
+        return cmd_stall(argv[1] if len(argv) > 1 else None)
     elif cmd == "on":
         save_config({"enabled": True})
         print(f"Watchdog on. Turns killed by a transient API error retry themselves "
@@ -501,7 +636,8 @@ def main(argv):
         save_config({argv[1]: _coerce(DEFAULTS[argv[1]], argv[2])})
         print(f"{argv[1]} = {json.dumps(config()[argv[1]])}")
     else:
-        print("usage: watchdog {on|off|status|doctor|log [n]|reset|reap|config|set KEY VALUE}",
+        print("usage: watchdog {on|off|status|doctor|stall [SECS|off]|log [n]|reset|"
+              "reap|config|set KEY VALUE}",
               file=sys.stderr)
         return 1
     return 0

@@ -1,7 +1,7 @@
 {
   "name": "watchdog",
   "displayName": "Watchdog",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Resumes a Claude Code turn that was killed by a transient API error, so unattended runs survive the night instead of waiting for someone to type \"continue\".",
   "author": {
     "name": "fuadnafiz98",
@@ -10,12 +10,14 @@
   "repository": "https://github.com/fuadnafiz98/plugins",
   "license": "MIT",
   "keywords": [
-    "watchdog",
-    "unattended",
     "api-error",
-    "retry",
+    "overnight",
     "resume",
-    "overnight"
+    "retry",
+    "stall",
+    "timeout",
+    "unattended",
+    "watchdog"
   ],
   "defaultEnabled": true
 }

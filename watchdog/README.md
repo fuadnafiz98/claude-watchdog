@@ -54,6 +54,49 @@ watchdog only sees what survives that, and only then starts its own backoff. So 
 error you should expect minutes of Claude Code's own retrying, then the resume. It is not
 idle; `watchdog log` shows exactly when it took over.
 
+## The other wait: a stalled stream
+
+A different failure, and the one that actually costs you time:
+
+```
+✻ Waiting for API response · will retry in 2m 0s · check your network
+```
+
+The request was accepted and then nothing came back. Claude Code will retry, and the
+retry usually succeeds immediately — but it waits **180 seconds** before giving up on
+the silent stream, and that wait is the whole cost. No hook fires while it happens
+(there is no event for a retry in progress), so the watchdog cannot resume its way out
+of this one. Cap the wait instead:
+
+```sh
+watchdog stall 60      # or /watchdog stall 60
+watchdog stall         # what is set, and what the session is actually using
+watchdog stall off     # back to 180s
+```
+
+That writes `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` into the `env` block of your
+`settings.json`, which is the only way to reach the process: a hook cannot change the
+environment of the session that spawned it. It applies to sessions started afterwards.
+Claude Code clamps the value to 10s–30min, so `watchdog stall` refuses anything
+outside that rather than writing a number that would be silently ignored.
+
+Careful below ~45s: the same clock covers the wait for the *first* byte, which a
+large-context turn can legitimately exceed, and cutting that off turns a slow request
+into a retry loop. 60s is the useful setting; 10s is a foot-gun.
+
+Measured, not inferred — against a local endpoint that accepts the request and then
+sends nothing:
+
+| `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` | request reissued after |
+| --- | --- |
+| unset | **180.1s** |
+| `20000` | **20.0s** |
+| `15000`, via `settings.json` | **15.1s** |
+
+and the CLI reports `stream idle: no bytes for 20000ms` when it gives up. The related
+`CLAUDE_STREAM_IDLE_TIMEOUT_MS` cannot do this: it is floored at 300s, so it only ever
+makes the wait longer.
+
 ## Why it isn't just a hook
 
 Claude Code ends a turn with one of two events, and the difference is the whole design:
@@ -305,6 +348,7 @@ your own shell:
 ```sh
 watchdog doctor
 watchdog log 20
+watchdog stall 60        # cap the wait on a silent stream (see above)
 watchdog reset           # clear counters and pending resumes
 watchdog reap            # kill orphaned monitors from a killed session
 watchdog test            # 72 checks
