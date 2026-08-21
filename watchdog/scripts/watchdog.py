@@ -59,6 +59,12 @@ DEFAULTS = {
     # for -- "The response stopped arriving" arrives as server_error:
     #   not resuming: Claude Code retries server_error itself
     "retry_types": ["rate_limit", "overloaded", "server_error", "unknown"],
+    # Fail open. An error type this list has never heard of is still a turn lying
+    # dead, and the cost of guessing wrong is one wasted resume against a session
+    # that stays stuck. Every regression this plugin has had was a refusal, never
+    # an over-eager retry, so the default leans the other way. Set false to make
+    # retry_types an allowlist again.
+    "retry_unlisted": True,
     "fatal_types": [
         "authentication_failed", "oauth_org_not_allowed", "billing_error",
         "invalid_request", "model_not_found", "max_output_tokens",
@@ -229,6 +235,8 @@ def classify(error_type, message, cfg):
         return "fatal", f"known-fatal error type {error_type}"
     if error_type in cfg["retry_types"]:
         return "retry", f"error type {error_type}"
+    if cfg["retry_unlisted"]:
+        return "retry", f"unlisted error type {error_type!r}, retrying anyway"
     return "unrecognised", f"unrecognised error type {error_type!r}"
 
 

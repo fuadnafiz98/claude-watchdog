@@ -92,12 +92,25 @@ out, _ = hook(h, error="rate_limit",
 check("spent quota beats retryable type", incident(h) is None, out)
 check("spent quota reported as known-fatal", "known-fatal" in msg(out), msg(out))
 
-# --- never-seen error type --------------------------------------------------
+# --- never-seen error type: fail open ---------------------------------------
+# A type the lists have never heard of is still a dead turn. Refusing it is how
+# 0.3.0 stranded real sessions, so an unlisted type is retried and says so.
 h = home()
 out, _ = hook(h, error="teapot_error", message="short and stout")
-check("unknown type not retried", incident(h) is None, out)
-check("unknown type flagged unrecognised",
-      "unrecognised" in msg(out) and "known-fatal" not in msg(out), msg(out))
+check("unlisted type is retried", incident(h) is not None, out)
+check("unlisted type says it was unlisted", "unlisted" in msg(out).lower()
+      or "retry 1/8" in msg(out), msg(out))
+
+h = home()
+out, _ = hook(h, error="teapot_error", message="short and stout",
+              WATCHDOG_RETRY_UNLISTED="0")
+check("retry_unlisted=0 restores the allowlist", incident(h) is None, out)
+check("and calls it unrecognised", "unrecognised" in msg(out), msg(out))
+
+# A fatal type must still beat fail-open, or the guard is decoration.
+h = home()
+out, _ = hook(h, error="billing_error", message="credit balance is too low")
+check("fatal still beats fail-open", incident(h) is None, out)
 
 # --- every transient type is resumed ----------------------------------------
 # Regression, 0.3.0-0.4.0: these were carved out on the theory that Claude Code
@@ -252,8 +265,17 @@ h = home()
 Path(h, "config.json").write_text(json.dumps({"max_retries": 1, "retry_types": ["teapot_error"]}))
 out, _ = hook(h, error="teapot_error", message="now allowed", sid="cfg")
 check("config file widens retry_types", incident(h, "cfg") is not None, out)
+# Narrowing takes both keys now: retry_types alone cannot refuse anything while
+# fail-open is on, which is the point of fail-open.
+h = home()
+Path(h, "config.json").write_text(json.dumps(
+    {"max_retries": 1, "retry_types": ["teapot_error"], "retry_unlisted": False}))
 out, _ = hook(h, error="server_error", sid="cfg2")
-check("config file narrows retry_types too", incident(h, "cfg2") is None, out)
+check("config file narrows retry_types with retry_unlisted off",
+      incident(h, "cfg2") is None, out)
+out, _ = hook(h, error="teapot_error", message="still allowed", sid="cfg3")
+check("and the narrowed list still lets its own type through",
+      incident(h, "cfg3") is not None, out)
 
 h = home()
 r = run(["set", "max_retries", "3"], h)

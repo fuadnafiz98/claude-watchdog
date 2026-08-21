@@ -205,7 +205,9 @@ flowchart TD
     Y -->|"auth · billing · model_not_found<br/>invalid_request · max_output_tokens"| F
     Y -->|no| R{error in<br/>retry_types?}
     R -->|"rate_limit · overloaded<br/>server_error · unknown"| G[schedule a resume]
-    R -->|anything else| S[report it, don't retry]
+    R -->|anything else| U{retry_unlisted?}
+    U -->|"yes (default)"| G
+    U -->|no| S[report it, don't retry]
 ```
 
 Text before type, because a spent quota arrives as `rate_limit` — retrying that hourly in
@@ -225,8 +227,32 @@ not resuming: Claude Code retries server_error itself
 against `API Error: The response stopped arriving`, which arrives as `server_error`. Fixed
 in 0.5.0; there is a test for that exact payload.
 
+**It fails open.** An error type no list has heard of is still a turn lying dead, so it is
+retried anyway and the message says `unlisted error type`. Every regression this plugin has
+shipped was a refusal, never an over-eager retry, and the cost of the two directions is not
+symmetric: a wrong retry wastes one turn, a wrong refusal leaves the session stuck until
+someone notices. `watchdog set retry_unlisted false` turns `retry_types` back into a strict
+allowlist.
+
 Backoff `5 → 15 → 30 → 60 → 120s`, 60s floor for rate limits and overload, 8 retries per
 session, counter resets after 12 idle hours.
+
+### A session runs the version it started with
+
+`${CLAUDE_PLUGIN_ROOT}` is resolved when the session starts, so the hook keeps running the
+plugin version that was installed then — `claude plugin update` and even `/reload-plugins`
+do not move a running session onto new code. Check what a session is actually running:
+
+```sh
+ps -ax -o args= | grep -o 'watchdog/[0-9.]*/scripts/monitor.sh' | sort | uniq -c
+```
+
+Policy lives in `~/.claude/watchdog/config.json`, which every version reads on every hook
+call, so a fix expressible as config reaches running sessions immediately:
+
+```sh
+watchdog set retry_types rate_limit,overloaded,server_error,unknown
+```
 
 ## Requirements
 
@@ -318,6 +344,7 @@ watchdog set resume_message "keep going ({attempt}/{max_retries})"
 | `slow_floor` | `60` | minimum wait for `slow_types` |
 | `slow_types` | `rate_limit, overloaded` | error types that get the floor |
 | `retry_types` | `rate_limit, overloaded, server_error, unknown` | retried |
+| `retry_unlisted` | `true` | retry an error type that is in no list |
 | `fatal_types` | auth, oauth, billing, invalid_request, model_not_found, max_output_tokens | never retried |
 | `fatal_text` | usage limit reached, credit balance, … | message substrings that veto a retry |
 | `channel` | `auto` | `auto`, `monitor`, or `tmux` |
